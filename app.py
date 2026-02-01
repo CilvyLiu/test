@@ -101,11 +101,27 @@ capital = st.sidebar.number_input("拟压仓资金", value=100000)
 # 【关键】替换 While True，使用自动定时刷新或手动按钮
 auto_run = st.sidebar.toggle("开启实时审计 (5s)", value=True)
 
+# ===================== 3. UI 实时获取逻辑修正 =====================
 try:
-    # 核心获取
-    df = ef.stock.get_realtime_quotes(target_code)
-    if df is not None and not df.empty:
+    # 修复点 1：确保 target_code 是列表，且去掉可能存在的空格
+    code_list = [target_code.strip()] 
+    
+    # 修复点 2：调用接口时显式传入列表
+    df = ef.stock.get_realtime_quotes(code_list)
+    
+    # 修复点 3：增加严密的空值审计
+    if df is None or len(df) == 0:
+        st.warning(f"🏦 古灵阁正在搜寻代码 {target_code}... 请确保代码正确（如 002415）")
+    else:
+        # 即使返回了数据，也要确保我们抓到的是那一只
         quote = df.iloc[0]
+        
+        # 某些情况下 efinance 会返回多行，过滤出我们想要的
+        if '代码' in df.columns:
+            target_df = df[df['代码'] == target_code]
+            if not target_df.empty:
+                quote = target_df.iloc[0]
+
         curr_p = safe_float(quote['最新价'])
         
         # 整理买卖盘
