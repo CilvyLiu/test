@@ -1,10 +1,22 @@
 import os
+import sys
+
+# ===================== 0. 【死命令】必须放在所有 import 之前 =====================
+# 1. 强行修改 HOME 环境变量，efinance 会优先读取这个
+os.environ["HOME"] = "/tmp" 
+# 2. 预先创建目标目录，防止 mkdir 冲突
+os.makedirs("/tmp/.efinance", exist_ok=True)
+# 3. 这里的 EFINANCE_DATA_DIR 也要跟上
+os.environ["EFINANCE_DATA_DIR"] = "/tmp/.efinance"
+
 import streamlit as st
-import efinance as ef
 import pandas as pd
 import numpy as np
 import time
 from datetime import datetime
+
+# 现在才允许 efinance 入场
+import efinance as ef
 
 # ===================== 0. 修复云端权限问题 =====================
 os.environ["HOME"] = "/tmp"  # efinance 默认缓存会写 $HOME/.efinance
@@ -15,7 +27,7 @@ ef.config.DATA_DIR = cache_dir
 # ===================== 1. 显式初始化缓存 =====================
 if "support_cache" not in st.session_state: st.session_state.support_cache = []
 if "score_cache" not in st.session_state: st.session_state.score_cache = []
-if "rebound_cache" not in st.session_state: st.session_state.rebound_cache = []  # (time, price)
+if "rebound_cache" not in st.session_state: st.session_state.rebound_cache = []
 if "prev_vol" not in st.session_state: st.session_state.prev_vol = 0
 if "hit_support" not in st.session_state: st.session_state.hit_support = False
 if "cooldown_until" not in st.session_state: st.session_state.cooldown_until = 0
