@@ -88,48 +88,50 @@ st.sidebar.title("🏦 古灵阁实战柜台")
 target_code = st.sidebar.text_input("股票代码", value="002415")
 capital = st.sidebar.number_input("拟压仓资金", value=100000)
 
-if st.sidebar.button("同步最新审计数据"):
-    st.rerun()  # 点击刷新即可
+# 自动刷新机制：每 3 秒刷新
+placeholder = st.empty()
+while True:
+    try:
+        df = ef.stock.get_realtime_quotes(target_code)
+        quote = df.iloc[0]
+        curr_p = safe_float(quote['最新价'])
 
-try:
-    df = ef.stock.get_realtime_quotes(target_code)
-    quote = df.iloc[0]
-    curr_p = safe_float(quote['最新价'])
+        # 买卖盘
+        asks = pd.DataFrame([{'价格':safe_float(quote[f'卖价{i}']), '数量':safe_float(quote[f'卖量{i}'])} for i in range(1,6)])
+        bids = pd.DataFrame([{'价格':safe_float(quote[f'买价{i}']), '数量':safe_float(quote[f'买量{i}'])} for i in range(1,6)])
 
-    # 买卖盘
-    asks = pd.DataFrame([{'价格':safe_float(quote[f'卖价{i}']), '数量':safe_float(quote[f'卖量{i}'])} for i in range(1,6)])
-    bids = pd.DataFrame([{'价格':safe_float(quote[f'买价{i}']), '数量':safe_float(quote[f'买量{i}'])} for i in range(1,6)])
+        # 审计引擎
+        p_sup, score, v_delta, sub_scores, score_stable = gringotts_kernel_v5_1(quote, asks, bids)
 
-    # 审计引擎
-    p_sup, score, v_delta, sub_scores, score_stable = gringotts_kernel_v5_1(quote, asks, bids)
+        # ----------- 渲染界面 -----------
+        with placeholder.container():
+            c1, c2, c3 = st.columns([1,2,1])
+            c1.metric("现价", f"¥{curr_p}", f"{quote['涨跌幅']}%")
 
-    # ----------- 顶部看板 -----------
-    c1, c2, c3 = st.columns([1,2,1])
-    c1.metric("现价", f"¥{curr_p}", f"{quote['涨跌幅']}%")
+            if time.time() < st.session_state.cooldown_until:
+                c2.error(f"🛡️ 古灵阁冷却中，支撑被击穿，锁定至 {datetime.fromtimestamp(st.session_state.cooldown_until).strftime('%H:%M:%S')}")
+            else:
+                score_color = "green" if score_stable else ("yellow" if score >= 40 else "red")
+                c2.markdown(f"<h1 style='text-align: center; color: {score_color};'>意图评分: {score}</h1>", unsafe_allow_html=True)
 
-    if time.time() < st.session_state.cooldown_until:
-        c2.error(f"🛡️ 古灵阁冷却中，支撑被击穿，锁定至 {datetime.fromtimestamp(st.session_state.cooldown_until).strftime('%H:%M:%S')}")
-    else:
-        score_color = "green" if score_stable else ("yellow" if score >= 40 else "red")
-        c2.markdown(f"<h1 style='text-align: center; color: {score_color};'>意图评分: {score}</h1>", unsafe_allow_html=True)
+            c3.metric("加权支撑线", f"¥{p_sup}", "稳定" if is_stable else "漂移/撤单")
 
-    c3.metric("加权支撑线", f"¥{p_sup}", "稳定" if is_stable else "漂移/撤单")
+            st.divider()
 
-    st.divider()
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.write(f"📊 盘口结构分: {sub_scores[0]}/30")
+            sc2.write(f"💧 资金增量分: {sub_scores[1]}/30")
+            sc3.write(f"⏳ 时间验证分: {sub_scores[2]}/40")
 
-    # ----------- 评分明细 -----------
-    sc1, sc2, sc3 = st.columns(3)
-    sc1.write(f"📊 盘口结构分: {sub_scores[0]}/30")
-    sc2.write(f"💧 资金增量分: {sub_scores[1]}/30")
-    sc3.write(f"⏳ 时间验证分: {sub_scores[2]}/40")
+            if score_stable:
+                st.success(f"🔥 重仓压仓：建议投入 ¥{capital * 0.4:,.0f} (40%)")
+            elif score >= 40:
+                st.warning(f"🟡 试探建仓：建议投入 ¥{capital * 0.1:,.0f} (10%)")
+            else:
+                st.info("⚪ 观望：金库防御中，等待稳定信号。")
 
-    # ----------- 仓位建议 -----------
-    if score_stable:
-        st.success(f"🔥 重仓压仓：建议投入 ¥{capital * 0.4:,.0f} (40%)")
-    elif score >= 40:
-        st.warning(f"🟡 试探建仓：建议投入 ¥{capital * 0.1:,.0f} (10%)")
-    else:
-        st.info("⚪ 观望：金库防御中，等待稳定信号。")
+        time.sleep(3)
 
-except Exception as e:
-    st.error(f"连接异常或权限问题: {e}")
+    except Exception as e:
+        st.error(f"连接异常或权限问题: {e}")
+        time.sleep(5)
