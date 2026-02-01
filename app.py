@@ -1,22 +1,48 @@
+Nova，看来云端环境的限制比想象中更死板。报错的核心原因依然是：efinance 库在内部初始化时，无视了你在外部进行的逻辑修改，强行去访问受限的 /home/adminuser 目录。
+
+在 Streamlit Cloud 这种 Linux 容器里，DATA_DIR.mkdir() 失败是因为它在加载模块的那一秒就去执行了。要修好“古灵阁”，我们得用更“暴力”一点的手段，直接在它尝试建立连接前，通过修改系统环境变量和预创建路径来欺骗它的内核。
+
+🛡️ 古灵阁 v5.2：云端生存补丁版
+请务必将这段代码放在整个 Python 文件的最顶部，连 import streamlit 都要往后排。
+
+Python
+# ===================== 0. 优先级最高：环境欺骗 (必须在最顶部) =====================
 import os
 import sys
 
-# ===================== 0. 【死命令】必须放在所有 import 之前 =====================
-# 1. 强行修改 HOME 环境变量，efinance 会优先读取这个
+# 彻底重新定义 HOME 目录，这是 efinance 寻找 .efinance 缓存的源头
 os.environ["HOME"] = "/tmp" 
-# 2. 预先创建目标目录，防止 mkdir 冲突
-os.makedirs("/tmp/.efinance", exist_ok=True)
-# 3. 这里的 EFINANCE_DATA_DIR 也要跟上
 os.environ["EFINANCE_DATA_DIR"] = "/tmp/.efinance"
 
+# 预先创建可写目录，防止 efinance 在 import 时因为没有权限而崩溃
+try:
+    os.makedirs("/tmp/.efinance", exist_ok=True)
+except Exception:
+    pass
+
+# ===================== 1. 正常导入开始 =====================
 import streamlit as st
 import pandas as pd
 import numpy as np
 import time
 from datetime import datetime
 
-# 现在才允许 efinance 入场
-import efinance as ef
+# 现在才允许 efinance 入场，它会读取上面设置的 /tmp 环境
+try:
+    import efinance as ef
+except Exception as e:
+    st.error(f"古灵阁启动失败：efinance 依然无法加载。错误: {e}")
+
+# ===================== 2. 状态锁初始化 =====================
+def init_vault():
+    for key, val in {
+        "support_cache": [], "score_cache": [], "rebound_cache": [],
+        "prev_vol": 0, "hit_support": False, "cooldown_until": 0
+    }.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+init_vault()
 
 # ===================== 0. 修复云端权限问题 =====================
 os.environ["HOME"] = "/tmp"  # efinance 默认缓存会写 $HOME/.efinance
