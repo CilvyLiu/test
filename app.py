@@ -107,16 +107,26 @@ with st.sidebar:
 # 主展示区容器
 main_container = st.empty()
 
+# ===================== 3. UI 实时获取逻辑 (参数加固版) =====================
 try:
-    # 格式化代码
-    code_list = [target_code]
-    df = ef.stock.get_realtime_quotes(code_list)
+    # 修复点：自动补全市场前缀 (efinance 规范：深市 0.xxxxxx, 沪市 1.xxxxxx)
+    symbol = target_code.strip()
+    if "." not in symbol:
+        # 6 开头为沪市，其余（00, 30, 002）通常为深市
+        full_code = f"1.{symbol}" if symbol.startswith('6') else f"0.{symbol}"
+    else:
+        full_code = symbol
+
+    # 调用接口时使用带前缀的完整代码
+    df = ef.stock.get_realtime_quotes([full_code])
     
+    if df is None or df.empty:
+        # 如果带前缀还查不到，尝试原始代码（容错机制）
+        df = ef.stock.get_realtime_quotes([symbol])
+
     if df is not None and not df.empty:
-        # 匹配对应代码
-        target_df = df[df['代码'] == target_code]
-        quote = target_df.iloc[0] if not target_df.empty else df.iloc[0]
-        
+        # 这里的匹配逻辑也要同步适配
+        quote = df.iloc[0]
         curr_p = safe_float(quote['最新价'])
         
         # 整理买卖盘数据
