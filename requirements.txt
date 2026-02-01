@@ -1,0 +1,4 @@
+streamlit>=1.31.0
+efinance>=0.5.3
+pandas>=1.5.3
+numpy>=1.23.5
