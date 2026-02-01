@@ -1,46 +1,32 @@
-# ===================== 0. 优先级最高：环境欺骗 (必须在最顶部) =====================
 import os
 import sys
+from pathlib import Path
 
-# 彻底重新定义 HOME 目录，这是 efinance 寻找 .efinance 缓存的源头
-os.environ["HOME"] = "/tmp" 
-os.environ["EFINANCE_DATA_DIR"] = "/tmp/.efinance"
+# ===================== 0. 【绝招】内存级路径拦截 =====================
+# 创建一个可写的临时目录
+fake_home = Path("/tmp/gringotts_data")
+fake_home.mkdir(parents=True, exist_ok=True)
 
-# 预先创建可写目录，防止 efinance 在 import 时因为没有权限而崩溃
-try:
-    os.makedirs("/tmp/.efinance", exist_ok=True)
-except Exception:
-    pass
+# 核心骗术：在 efinance 加载前，强行预定义它的配置项
+import types
+cfg = types.ModuleType('efinance.config')
+cfg.DATA_DIR = fake_home
+cfg.SEARCH_RESULT_CACHE_PATH = fake_home / "search_cache"
+cfg.MAX_CONNECTIONS = 10
+# 将伪造的模块注入系统缓存
+sys.modules['efinance.config'] = cfg
 
-# ===================== 1. 正常导入开始 =====================
+# 此时再导入 efinance，它会直接使用我们塞给它的 cfg
 import streamlit as st
+try:
+    import efinance as ef
+except Exception as e:
+    st.error(f"古灵阁三级防御失败，请检查云端磁盘空间: {e}")
+
 import pandas as pd
 import numpy as np
 import time
 from datetime import datetime
-
-# 现在才允许 efinance 入场，它会读取上面设置的 /tmp 环境
-try:
-    import efinance as ef
-except Exception as e:
-    st.error(f"古灵阁启动失败：efinance 依然无法加载。错误: {e}")
-
-# ===================== 2. 状态锁初始化 =====================
-def init_vault():
-    for key, val in {
-        "support_cache": [], "score_cache": [], "rebound_cache": [],
-        "prev_vol": 0, "hit_support": False, "cooldown_until": 0
-    }.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
-
-init_vault()
-
-# ===================== 0. 修复云端权限问题 =====================
-os.environ["HOME"] = "/tmp"  # efinance 默认缓存会写 $HOME/.efinance
-cache_dir = "/tmp/efinance_cache"
-os.makedirs(cache_dir, exist_ok=True)
-ef.config.DATA_DIR = cache_dir
 
 # ===================== 1. 显式初始化缓存 =====================
 if "support_cache" not in st.session_state: st.session_state.support_cache = []
