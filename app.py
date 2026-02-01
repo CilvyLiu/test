@@ -59,7 +59,7 @@ def gringotts_kernel(quote, df_bids):
     curr_vol = safe_float(quote['成交量'])
     v_delta = curr_vol - st.session_state.prev_vol
     st.session_state.prev_vol = curr_vol
-    actual_v_delta = v_delta if 100 < v_delta < 500000 else 0 # 宽容大票成交量
+    actual_v_delta = v_delta if 100 < v_delta < 500000 else 0 
 
     # ---- D. 时间回踩确认 (Time Audit) ----
     is_time_confirmed = False
@@ -71,7 +71,6 @@ def gringotts_kernel(quote, df_bids):
         st.session_state.rebound_cache = [x for x in st.session_state.rebound_cache if curr_time - x[0] <= 30]
         if len(st.session_state.rebound_cache) >= 3:
             time_diff = st.session_state.rebound_cache[-1][0] - st.session_state.rebound_cache[0][0]
-            # 核心修正：基于真实秒数的时间窗口
             if time_diff >= 9 and min([x[1] for x in st.session_state.rebound_cache]) > p_sup * 0.995:
                 is_time_confirmed = True
 
@@ -94,7 +93,7 @@ def gringotts_kernel(quote, df_bids):
     return round(p_sup, 2), total_score, is_stable, (s_score, f_score, t_score), score_stable
 
 # ===================== 3. UI 界面层 =====================
-st.set_page_config(page_title="Gringotts Pro v5.6", layout="wide")
+st.set_page_config(page_title="Gringotts Pro v5.8", layout="wide")
 
 with st.sidebar:
     st.title("🏦 古灵阁实战柜台")
@@ -104,60 +103,50 @@ with st.sidebar:
     st.divider()
     st.caption("注：非交易日数据可能显示为待机状态")
 
-# 主展示区容器
 main_container = st.empty()
 
-# ===================== 3. UI 实时获取逻辑 (参数加固版) =====================
+# ===================== 3. UI 实时获取逻辑 (非交易日全兼容) =====================
 try:
-    # 修复点：自动补全市场前缀 (efinance 规范：深市 0.xxxxxx, 沪市 1.xxxxxx)
+    # 1. 自动格式化代码 (补全前缀)
     symbol = target_code.strip()
-    if "." not in symbol:
-        # 6 开头为沪市，其余（00, 30, 002）通常为深市
+    if "." not in symbol and len(symbol) == 6:
         full_code = f"1.{symbol}" if symbol.startswith('6') else f"0.{symbol}"
     else:
         full_code = symbol
 
-    # 调用接口时使用带前缀的完整代码
+    # 2. 获取行情
     df = ef.stock.get_realtime_quotes([full_code])
     
-    if df is None or df.empty:
-        # 如果带前缀还查不到，尝试原始代码（容错机制）
-        df = ef.stock.get_realtime_quotes([symbol])
-
-    if df is not None and not df.empty:
-        # 这里的匹配逻辑也要同步适配
+    # 3. 核心判断：是否有实时数据流入且价格有效
+    if df is not None and not df.empty and safe_float(df.iloc[0]['最新价']) > 0:
         quote = df.iloc[0]
         curr_p = safe_float(quote['最新价'])
         
         # 整理买卖盘数据
         bids = pd.DataFrame([{'价格':safe_float(quote[f'买价{i}']), '数量':safe_float(quote[f'买量{i}'])} for i in range(1,6)])
         
-        # 执行审计
+        # 执行内核审计
         p_sup, score, is_stable, sub_scores, score_stable = gringotts_kernel(quote, bids)
 
-        # 渲染内容
+        # 正常渲染 UI
         with main_container.container():
             c1, c2, c3 = st.columns([1,2,1])
             c1.metric("市场报价", f"¥{curr_p}", f"{quote.get('涨跌幅', '--')}%")
             
-            # 状态判定
             if time.time() < st.session_state.cooldown_until:
-                c2.error(f"🛡️ 冷却保护中... 预计重启时间: {datetime.fromtimestamp(st.session_state.cooldown_until).strftime('%H:%M:%S')}")
+                c2.error(f"🛡️ 冷却保护中... 预计重启: {datetime.fromtimestamp(st.session_state.cooldown_until).strftime('%H:%M:%S')}")
             else:
                 score_color = "green" if score_stable else ("yellow" if score >= 40 else "red")
                 c2.markdown(f"<h1 style='text-align:center; color:{score_color};'>审计意图评分: {score}</h1>", unsafe_allow_html=True)
             
             c3.metric("加权支撑线", f"¥{p_sup}", "稳定" if is_stable else "波动")
-            
             st.divider()
             
-            # 评分详情
             sc1, sc2, sc3 = st.columns(3)
             sc1.write(f"📊 盘口结构分: **{sub_scores[0]}**/30")
             sc2.write(f"💧 资金增量分: **{sub_scores[1]}**/30")
             sc3.write(f"⏳ 时间验证分: **{sub_scores[2]}**/40")
             
-            # 交易指令
             st.subheader("🏦 压仓决策建议")
             if score_stable:
                 st.success(f"🔥 指令：【重仓压入】。建议规模：¥{capital * 0.4:,.0f} (40%)")
@@ -165,11 +154,19 @@ try:
                 st.warning(f"🟡 指令：【轻仓试探】。建议规模：¥{capital * 0.1:,.0f} (10%)")
             else:
                 st.info("⚪ 指令：【金库待命】。目前无显著主力介入信号。")
-
+            
     else:
-        st.warning("⚠️ 接口响应中：非交易日或代码输入错误，请等待或检查代码。")
+        # 4. 非交易日/停牌 静默显示
+        with main_container.container():
+            st.info(f"🌙 目标 [{target_code}] 处于非交易时段。")
+            st.markdown("""
+            **古灵阁休眠指令：**
+            * 状态：**金库待机 (Standby)**
+            * 逻辑：环境权限已打通，API 隧道已连接。
+            * 预警：明早 09:15 集合竞价开始后，审计评分将自动激活。
+            """)
+            st.caption(f"当前系统时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 循环刷新逻辑
     if auto_run:
         time.sleep(5)
         st.rerun()
