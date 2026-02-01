@@ -1,50 +1,46 @@
 import os
 import sys
+import time
+import types
 from pathlib import Path
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import streamlit as st
 
-# ===================== 0. 【绝招】内存级路径拦截 =====================
-# 创建一个可写的临时目录
+# ===================== 0. 内存级拦截 (权限解) =====================
 fake_home = Path("/tmp/gringotts_data")
 fake_home.mkdir(parents=True, exist_ok=True)
 
-# 核心骗术：在 efinance 加载前，强行预定义它的配置项
-import types
-cfg = types.ModuleType('efinance.config')
-cfg.DATA_DIR = fake_home
-cfg.SEARCH_RESULT_CACHE_PATH = fake_home / "search_cache"
-cfg.MAX_CONNECTIONS = 10
-# 将伪造的模块注入系统缓存
-sys.modules['efinance.config'] = cfg
+if 'efinance.config' not in sys.modules:
+    cfg = types.ModuleType('efinance.config')
+    cfg.DATA_DIR = fake_home
+    cfg.SEARCH_RESULT_CACHE_PATH = fake_home / "search_cache"
+    cfg.MAX_CONNECTIONS = 10
+    sys.modules['efinance.config'] = cfg
 
-# 此时再导入 efinance，它会直接使用我们塞给它的 cfg
-import streamlit as st
-try:
-    import efinance as ef
-except Exception as e:
-    st.error(f"古灵阁三级防御失败，请检查云端磁盘空间: {e}")
+import efinance as ef
 
-import pandas as pd
-import numpy as np
-import time
-from datetime import datetime
+# ===================== 1. 状态初始化 =====================
+def init_vault():
+    state_keys = {
+        "support_cache": [], "score_cache": [], "rebound_cache": [],
+        "prev_vol": 0, "hit_support": False, "cooldown_until": 0
+    }
+    for key, val in state_keys.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
 
-# ===================== 1. 显式初始化缓存 =====================
-if "support_cache" not in st.session_state: st.session_state.support_cache = []
-if "score_cache" not in st.session_state: st.session_state.score_cache = []
-if "rebound_cache" not in st.session_state: st.session_state.rebound_cache = []
-if "prev_vol" not in st.session_state: st.session_state.prev_vol = 0
-if "hit_support" not in st.session_state: st.session_state.hit_support = False
-if "cooldown_until" not in st.session_state: st.session_state.cooldown_until = 0
+init_vault()
 
 def safe_float(x, default=0.0):
     try:
         if x in ['-', '--', None, '', 'None']: return default
         return float(x)
-    except:
-        return default
+    except: return default
 
-# ===================== 2. 核心审计引擎 =====================
-def gringotts_kernel_v5_1(quote, df_asks, df_bids):
+# ===================== 2. 审计引擎 =====================
+def gringotts_kernel(quote, df_bids):
     curr_p = safe_float(quote['最新价'])
     curr_time = time.time()
 
@@ -72,19 +68,17 @@ def gringotts_kernel_v5_1(quote, df_asks, df_bids):
 
     if st.session_state.hit_support:
         st.session_state.rebound_cache.append((curr_time, curr_p))
-        # 只保留最近 30 秒数据
         st.session_state.rebound_cache = [x for x in st.session_state.rebound_cache if curr_time - x[0] <= 30]
-
         if len(st.session_state.rebound_cache) >= 3:
             time_diff = st.session_state.rebound_cache[-1][0] - st.session_state.rebound_cache[0][0]
             if time_diff >= 9 and min([x[1] for x in st.session_state.rebound_cache]) > p_sup * 0.995:
                 is_time_confirmed = True
 
-    # ---- E. 彻底失败保护 ----
+    # ---- E. 保护机制 ----
     if curr_p < p_sup * 0.98:
         st.session_state.hit_support = False
         st.session_state.rebound_cache = []
-        st.session_state.cooldown_until = curr_time + 300  # 5 分钟冷却
+        st.session_state.cooldown_until = curr_time + 300
 
     # ---- F. 评分系统 ----
     s_score = 30 if is_stable else 0
@@ -96,58 +90,59 @@ def gringotts_kernel_v5_1(quote, df_asks, df_bids):
     st.session_state.score_cache = st.session_state.score_cache[-5:]
     score_stable = len(st.session_state.score_cache) >= 3 and min(st.session_state.score_cache[-3:]) >= 70
 
-    return round(p_sup, 2), total_score, actual_v_delta, (s_score, f_score, t_score), score_stable
+    return round(p_sup, 2), total_score, is_stable, (s_score, f_score, t_score), score_stable
 
-# ===================== 3. Streamlit UI =====================
-st.set_page_config(page_title="Gringotts v5.1", layout="wide")
+# ===================== 3. UI 界面 =====================
+st.set_page_config(page_title="Gringotts v5.5", layout="wide")
 st.sidebar.title("🏦 古灵阁实战柜台")
 target_code = st.sidebar.text_input("股票代码", value="002415")
 capital = st.sidebar.number_input("拟压仓资金", value=100000)
 
-# 自动刷新机制：每 3 秒刷新
-placeholder = st.empty()
-while True:
-    try:
-        df = ef.stock.get_realtime_quotes(target_code)
+# 【关键】替换 While True，使用自动定时刷新或手动按钮
+auto_run = st.sidebar.toggle("开启实时审计 (5s)", value=True)
+
+try:
+    # 核心获取
+    df = ef.stock.get_realtime_quotes(target_code)
+    if df is not None and not df.empty:
         quote = df.iloc[0]
         curr_p = safe_float(quote['最新价'])
-
-        # 买卖盘
-        asks = pd.DataFrame([{'价格':safe_float(quote[f'卖价{i}']), '数量':safe_float(quote[f'卖量{i}'])} for i in range(1,6)])
+        
+        # 整理买卖盘
         bids = pd.DataFrame([{'价格':safe_float(quote[f'买价{i}']), '数量':safe_float(quote[f'买量{i}'])} for i in range(1,6)])
+        
+        # 运行内核
+        p_sup, score, is_stable, sub_scores, score_stable = gringotts_kernel(quote, bids)
 
-        # 审计引擎
-        p_sup, score, v_delta, sub_scores, score_stable = gringotts_kernel_v5_1(quote, asks, bids)
+        # UI 渲染
+        c1, c2, c3 = st.columns([1,2,1])
+        c1.metric("现价", f"¥{curr_p}", f"{quote['涨跌幅']}%")
 
-        # ----------- 渲染界面 -----------
-        with placeholder.container():
-            c1, c2, c3 = st.columns([1,2,1])
-            c1.metric("现价", f"¥{curr_p}", f"{quote['涨跌幅']}%")
+        if time.time() < st.session_state.cooldown_until:
+            c2.error(f"🛡️ 冷却中，锁定至 {datetime.fromtimestamp(st.session_state.cooldown_until).strftime('%H:%M:%S')}")
+        else:
+            color = "green" if score_stable else ("yellow" if score >= 40 else "red")
+            c2.markdown(f"<h1 style='text-align:center; color:{color};'>意图评分: {score}</h1>", unsafe_allow_html=True)
 
-            if time.time() < st.session_state.cooldown_until:
-                c2.error(f"🛡️ 古灵阁冷却中，支撑被击穿，锁定至 {datetime.fromtimestamp(st.session_state.cooldown_until).strftime('%H:%M:%S')}")
-            else:
-                score_color = "green" if score_stable else ("yellow" if score >= 40 else "red")
-                c2.markdown(f"<h1 style='text-align: center; color: {score_color};'>意图评分: {score}</h1>", unsafe_allow_html=True)
+        c3.metric("加权支撑线", f"¥{p_sup}", "稳定" if is_stable else "波动")
+        
+        st.divider()
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.write(f"📊 盘口结构: {sub_scores[0]}/30")
+        sc2.write(f"💧 资金增量: {sub_scores[1]}/30")
+        sc3.write(f"⏳ 时间验证: {sub_scores[2]}/40")
 
-            c3.metric("加权支撑线", f"¥{p_sup}", "稳定" if is_stable else "漂移/撤单")
+        if score_stable:
+            st.success(f"🔥 重仓压仓：建议建议 ¥{capital * 0.4:,.0f} (40%)")
+        elif score >= 40:
+            st.warning(f"🟡 试探建仓：建议建议 ¥{capital * 0.1:,.0f} (10%)")
+        else:
+            st.info("⚪ 观望：金库防御中...")
 
-            st.divider()
-
-            sc1, sc2, sc3 = st.columns(3)
-            sc1.write(f"📊 盘口结构分: {sub_scores[0]}/30")
-            sc2.write(f"💧 资金增量分: {sub_scores[1]}/30")
-            sc3.write(f"⏳ 时间验证分: {sub_scores[2]}/40")
-
-            if score_stable:
-                st.success(f"🔥 重仓压仓：建议投入 ¥{capital * 0.4:,.0f} (40%)")
-            elif score >= 40:
-                st.warning(f"🟡 试探建仓：建议投入 ¥{capital * 0.1:,.0f} (10%)")
-            else:
-                st.info("⚪ 观望：金库防御中，等待稳定信号。")
-
-        time.sleep(3)
-
-    except Exception as e:
-        st.error(f"连接异常或权限问题: {e}")
+    # 如果开启自动刷新，5秒后重新运行脚本
+    if auto_run:
         time.sleep(5)
+        st.rerun()
+
+except Exception as e:
+    st.error(f"审计异常: {e}")
