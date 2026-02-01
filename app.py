@@ -3,12 +3,12 @@ import sys
 import time
 import types
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 import streamlit as st
 
-# ===================== 0. 权限与内存劫持 (必须在 import ef 之前) =====================
+# ===================== 0. 权限与内存劫持 =====================
 fake_home = Path("/tmp/gringotts_data")
 fake_home.mkdir(parents=True, exist_ok=True)
 
@@ -21,7 +21,14 @@ if 'efinance.config' not in sys.modules:
 
 import efinance as ef
 
-# ===================== 1. 状态锁初始化 =====================
+# ===================== 1. 时区与状态初始化 =====================
+# 强制定义东八区
+TZ_CHINA = timezone(timedelta(hours=8))
+
+def get_now_china():
+    """获取当前的东八区时间"""
+    return datetime.now(timezone.utc).astimezone(TZ_CHINA)
+
 def init_vault():
     state_keys = {
         "support_cache": [], "score_cache": [], "rebound_cache": [],
@@ -44,24 +51,24 @@ def gringotts_kernel(quote, df_bids):
     curr_p = safe_float(quote['最新价'])
     curr_time = time.time()
 
-    # ---- A. 盘口结构审计 (Structure) ----
+    # ---- A. 盘口结构审计 ----
     top_bids = df_bids.head(3).copy()
     top_bids['pf'] = top_bids['价格'].apply(safe_float)
     top_bids['vf'] = top_bids['数量'].apply(safe_float)
     p_sup = np.average(top_bids['pf'], weights=top_bids['vf']) if top_bids['vf'].sum() > 0 else curr_p
 
-    # ---- B. 支撑稳定性 (Stability) ----
+    # ---- B. 支撑稳定性 ----
     st.session_state.support_cache.append(p_sup)
     st.session_state.support_cache = st.session_state.support_cache[-5:]
     is_stable = (max(st.session_state.support_cache) - min(st.session_state.support_cache)) <= 0.02 if len(st.session_state.support_cache) >= 3 else False
 
-    # ---- C. 资金流向审计 (Flow) ----
+    # ---- C. 资金流向审计 ----
     curr_vol = safe_float(quote['成交量'])
     v_delta = curr_vol - st.session_state.prev_vol
     st.session_state.prev_vol = curr_vol
     actual_v_delta = v_delta if 100 < v_delta < 500000 else 0 
 
-    # ---- D. 时间回踩确认 (Time Audit) ----
+    # ---- D. 时间回踩确认 ----
     is_time_confirmed = False
     if curr_p > 0 and curr_p <= p_sup * 1.002:
         st.session_state.hit_support = True
@@ -74,13 +81,14 @@ def gringotts_kernel(quote, df_bids):
             if time_diff >= 9 and min([x[1] for x in st.session_state.rebound_cache]) > p_sup * 0.995:
                 is_time_confirmed = True
 
-    # ---- E. 保护机制 (Risk Control) ----
+    # ---- E. 保护机制 ----
     if curr_p > 0 and curr_p < p_sup * 0.98:
         st.session_state.hit_support = False
         st.session_state.rebound_cache = []
+        # 冷却 5 分钟
         st.session_state.cooldown_until = curr_time + 300
 
-    # ---- F. 结构化评分 ----
+    # ---- F. 评分系统 ----
     s_score = 30 if is_stable else 0
     f_score = 30 if actual_v_delta > 500 else 0
     t_score = 40 if is_time_confirmed else 0
@@ -93,48 +101,44 @@ def gringotts_kernel(quote, df_bids):
     return round(p_sup, 2), total_score, is_stable, (s_score, f_score, t_score), score_stable
 
 # ===================== 3. UI 界面层 =====================
-st.set_page_config(page_title="Gringotts Pro v5.8", layout="wide")
+st.set_page_config(page_title="Gringotts TimeFix v5.9", layout="wide")
 
 with st.sidebar:
     st.title("🏦 古灵阁实战柜台")
-    target_code = st.text_input("股票代码 (如 002415)", value="002415").strip()
+    target_code = st.text_input("股票代码", value="002415").strip()
     capital = st.number_input("拟压仓资金", value=100000)
     auto_run = st.toggle("开启实时审计 (5s)", value=True)
     st.divider()
-    st.caption("注：非交易日数据可能显示为待机状态")
+    st.write(f"🕒 系统时区: **北京时间 (UTC+8)**")
+    st.write(f"当前时间: {get_now_china().strftime('%H:%M:%S')}")
 
 main_container = st.empty()
 
-# ===================== 3. UI 实时获取逻辑 (非交易日全兼容) =====================
 try:
-    # 1. 自动格式化代码 (补全前缀)
     symbol = target_code.strip()
     if "." not in symbol and len(symbol) == 6:
         full_code = f"1.{symbol}" if symbol.startswith('6') else f"0.{symbol}"
     else:
         full_code = symbol
 
-    # 2. 获取行情
     df = ef.stock.get_realtime_quotes([full_code])
     
-    # 3. 核心判断：是否有实时数据流入且价格有效
     if df is not None and not df.empty and safe_float(df.iloc[0]['最新价']) > 0:
         quote = df.iloc[0]
         curr_p = safe_float(quote['最新价'])
-        
-        # 整理买卖盘数据
         bids = pd.DataFrame([{'价格':safe_float(quote[f'买价{i}']), '数量':safe_float(quote[f'买量{i}'])} for i in range(1,6)])
         
-        # 执行内核审计
         p_sup, score, is_stable, sub_scores, score_stable = gringotts_kernel(quote, bids)
 
-        # 正常渲染 UI
         with main_container.container():
             c1, c2, c3 = st.columns([1,2,1])
             c1.metric("市场报价", f"¥{curr_p}", f"{quote.get('涨跌幅', '--')}%")
             
+            # 使用东八区时间渲染冷却
             if time.time() < st.session_state.cooldown_until:
-                c2.error(f"🛡️ 冷却保护中... 预计重启: {datetime.fromtimestamp(st.session_state.cooldown_until).strftime('%H:%M:%S')}")
+                # 将 timestamp 转为东八区 datetime
+                cd_dt = datetime.fromtimestamp(st.session_state.cooldown_until, tz=timezone.utc).astimezone(TZ_CHINA)
+                c2.error(f"🛡️ 冷却保护中... 预计重启: {cd_dt.strftime('%H:%M:%S')}")
             else:
                 score_color = "green" if score_stable else ("yellow" if score >= 40 else "red")
                 c2.markdown(f"<h1 style='text-align:center; color:{score_color};'>审计意图评分: {score}</h1>", unsafe_allow_html=True)
@@ -149,23 +153,21 @@ try:
             
             st.subheader("🏦 压仓决策建议")
             if score_stable:
-                st.success(f"🔥 指令：【重仓压入】。建议规模：¥{capital * 0.4:,.0f} (40%)")
+                st.success(f"🔥 指令：【重仓压入】 (40%)")
             elif score >= 40:
-                st.warning(f"🟡 指令：【轻仓试探】。建议规模：¥{capital * 0.1:,.0f} (10%)")
+                st.warning(f"🟡 指令：【轻仓试探】 (10%)")
             else:
-                st.info("⚪ 指令：【金库待命】。目前无显著主力介入信号。")
+                st.info("⚪ 指令：【金库待命】")
             
     else:
-        # 4. 非交易日/停牌 静默显示
         with main_container.container():
             st.info(f"🌙 目标 [{target_code}] 处于非交易时段。")
-            st.markdown("""
-            **古灵阁休眠指令：**
-            * 状态：**金库待机 (Standby)**
-            * 逻辑：环境权限已打通，API 隧道已连接。
-            * 预警：明早 09:15 集合竞价开始后，审计评分将自动激活。
+            st.markdown(f"""
+            **古灵阁休眠指令 (Standby)：**
+            * 逻辑：环境与 API 隧道正常。
+            * 时区确认：已强制同步至 **北京时间 (CST)**。
+            * 当前北京时间: `{get_now_china().strftime('%Y-%m-%d %H:%M:%S')}`
             """)
-            st.caption(f"当前系统时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     if auto_run:
         time.sleep(5)
