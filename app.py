@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-import types
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -19,7 +18,8 @@ def is_trading_time():
     now = get_now_china()
     if now.weekday() >= 5: return False
     hm = now.hour * 100 + now.minute
-    return (915 <= hm <= 1135) or (1300 <= hm <= 1505)
+    # 稍微拓宽一点监控边界
+    return (915 <= hm <= 1135) or (1255 <= hm <= 1505)
 
 def init_vault():
     state_keys = {
@@ -38,7 +38,7 @@ def safe_float(x, default=0.0):
         return float(x)
     except: return default
 
-# ===================== 2. 核心审计引擎 (保持逻辑不变) =====================
+# ===================== 2. 核心审计引擎 =====================
 def gringotts_kernel(quote, df_bids):
     curr_p = safe_float(quote['最新价'])
     curr_time = time.time()
@@ -88,9 +88,17 @@ def gringotts_kernel(quote, df_bids):
 # ===================== 3. UI 界面层 =====================
 st.set_page_config(page_title="Gringotts Final v6.2", layout="wide")
 
+# 自定义深蓝色风格 CSS
+st.markdown("""
+    <style>
+    .reportview-container .main .block-container { color: #1A5276; }
+    h1, h2, h3 { color: #1A5276 !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
 with st.sidebar:
     st.title("🏦 古灵阁实战柜台")
-    target_code = st.text_input("股票代码", value="002415").strip()
+    target_code = st.text_input("股票代码 (如 002206)", value="002206").strip()
     capital = st.number_input("拟压仓资金", value=100000)
     auto_run = st.toggle("开启实时审计 (5s)", value=True)
     st.divider()
@@ -104,8 +112,8 @@ main_container = st.empty()
 
 # ===================== 4. 稳健获取 (原生接口版) =====================
 def fetch_tencent_data(code):
+    if not code or len(code) < 6: return None
     try:
-        # 转换前缀
         prefix = "sh" if code.startswith('6') else "sz"
         url = f"http://qt.gtimg.cn/q={prefix}{code}"
         r = requests.get(url, timeout=2)
@@ -142,22 +150,22 @@ try:
                 if time.time() < st.session_state.cooldown_until:
                     c2.error("🛡️ 冷却保护中...")
                 else:
-                    color = "green" if score_stable else ("yellow" if score >= 40 else "red")
-                    c2.markdown(f"<h1 style='text-align:center; color:{color};'>审计意图评分: {score}</h1>", unsafe_allow_html=True)
+                    # 调色盘：深墨绿(稳)、暗金(中)、深蓝(低)
+                    color = "#145A32" if score_stable else ("#9A7D0A" if score >= 40 else "#1A5276")
+                    c2.markdown(f"<h1 style='text-align:center; color:{color};'>审计评分: {score}</h1>", unsafe_allow_html=True)
                 
                 c3.metric("加权支撑线", f"¥{p_sup}", "稳定" if is_stable else "波动")
                 st.divider()
                 
-                # 决策区
                 st.subheader("🏦 压仓决策建议")
                 if score_stable:
-                    st.success(f"🔥 指令：【重仓压入】建议规模：¥{capital * 0.4:,.0f}")
+                    st.success(f"🔱 指令：【重仓压入】建议规模：¥{capital * 0.4:,.0f}")
                 elif score >= 40:
-                    st.warning(f"🟡 指令：【轻仓试探】建议规模：¥{capital * 0.1:,.0f}")
+                    st.warning(f"🏺 指令：【轻仓试探】建议规模：¥{capital * 0.1:,.0f}")
                 else:
-                    st.info("⚪ 指令：【金库待命】目前无显著信号")
+                    st.info("📜 指令：【金库待命】目前无显著信号")
             else:
-                st.error(f"⚠️ 正在尝试通过备用通道连接 [{target_code}] ...")
+                st.error(f"⚠️ 正在尝试连接数据源，请确认代码 [{target_code}] 是否正确...")
     else:
         st.info(f"🌙 目标 [{target_code}] 处于非交易时段。")
 
@@ -166,4 +174,4 @@ try:
         st.rerun()
 
 except Exception as e:
-    st.error(f"古灵阁运行审计异常: {e}")
+    st.error(f"审计异常: {e}")
