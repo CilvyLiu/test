@@ -23,8 +23,8 @@ def is_trading_time():
 def init_vault():
     state_keys = {
         "support_cache": [], "score_cache": [], "rebound_cache": [],
-        "v_delta_cache": [0.0]*5, # 新增：存储成交增量历史
-        "prev_vol": 0, "hit_support": False, "cooldown_until": 0
+        "v_delta_cache": [0.0]*5, 
+        "prev_vol": 0.0, "hit_support": False, "cooldown_until": 0.0
     }
     for key, val in state_keys.items():
         if key not in st.session_state:
@@ -38,7 +38,7 @@ def safe_float(x, default=0.0):
         return float(x)
     except: return default
 
-# ===================== 2. 核心审计引擎 (集成力竭监测) =====================
+# ===================== 2. 核心审计引擎 (修复数据类型) =====================
 def gringotts_kernel(quote, df_bids, df_asks):
     curr_p = safe_float(quote['最新价'])
     curr_time = time.time()
@@ -53,25 +53,25 @@ def gringotts_kernel(quote, df_bids, df_asks):
     st.session_state.support_cache = st.session_state.support_cache[-5:]
     is_stable = (max(st.session_state.support_cache) - min(st.session_state.support_cache)) <= 0.02 if len(st.session_state.support_cache) >= 3 else False
 
-    # --- 力竭审计逻辑 (Anti-Quant) ---
+    # --- 力竭审计逻辑 (修复关键点) ---
     curr_vol = safe_float(quote['成交量'])
-    v_delta = curr_vol - st.session_state.prev_vol if st.session_state.prev_vol > 0 else 0
+    # 强制确保 prev_vol 也是 float
+    prev_vol_f = float(st.session_state.prev_vol)
+    v_delta = curr_vol - prev_vol_f if prev_vol_f > 0 else 0.0
     st.session_state.prev_vol = curr_vol
     
-    # 更新成交增量缓存
     st.session_state.v_delta_cache.append(v_delta)
     st.session_state.v_delta_cache = st.session_state.v_delta_cache[-5:]
     
-    # 1. 挂单厚度比 (Order Book Power)
-    bid_power = df_bids['数量'].sum()
-    ask_power = df_asks['数量'].sum()
+    bid_power = df_bids['数量'].apply(safe_float).sum()
+    ask_power = df_asks['数量'].apply(safe_float).sum()
     ob_ratio = bid_power / ask_power if ask_power > 0 else 1.0
     
-    # 2. 成交动能衰减 (Standard Deviation of Volume)
     vol_std = np.std(st.session_state.v_delta_cache)
-    is_exhausted = vol_std < 500 and v_delta < 1000 # 极小波动且成交稀疏即为力竭
+    # 此处逻辑：标准差小且最新增量低 = 卖压力竭
+    is_exhausted = vol_std < 500 and v_delta < 1000
 
-    # --- 评分权重修正 ---
+    # --- 评分权重 ---
     is_time_confirmed = False
     if curr_p > 0 and curr_p <= p_sup * 1.002:
         st.session_state.hit_support = True
@@ -90,7 +90,7 @@ def gringotts_kernel(quote, df_bids, df_asks):
         st.session_state.cooldown_until = curr_time + 300
 
     s_score = 30 if is_stable else 0
-    f_score = 30 if (v_delta > 500 or is_exhausted) else 0 # 力竭横盘也给予防御分数
+    f_score = 30 if (v_delta > 500 or is_exhausted) else 0 
     t_score = 40 if is_time_confirmed else 0
     total_score = s_score + f_score + t_score
 
@@ -99,33 +99,21 @@ def gringotts_kernel(quote, df_bids, df_asks):
     score_stable = len(st.session_state.score_cache) >= 3 and min(st.session_state.score_cache[-3:]) >= 70
 
     return {
-        "p_sup": round(p_sup, 2),
-        "score": total_score,
-        "is_stable": is_stable,
-        "score_stable": score_stable,
-        "ob_ratio": round(ob_ratio, 2),
-        "vol_std": round(vol_std, 1),
-        "is_exhausted": is_exhausted
+        "p_sup": round(p_sup, 2), "score": total_score, "is_stable": is_stable,
+        "score_stable": score_stable, "ob_ratio": round(ob_ratio, 2),
+        "vol_std": round(vol_std, 1), "is_exhausted": is_exhausted
     }
 
 # ===================== 3. UI 界面层 =====================
-st.set_page_config(page_title="Gringotts Final v6.3", layout="wide")
+st.set_page_config(page_title="Gringotts Final v6.4", layout="wide")
 
-st.markdown("""
-    <style>
-    .reportview-container .main .block-container { color: #1A5276; }
-    h1, h2, h3 { color: #1A5276 !important; }
-    .stMetric { background-color: #f0f2f6; padding: 10px; border-radius: 5px; }
-    </style>
-    """, unsafe_allow_html=True)
+st.markdown("""<style> h1, h2, h3 { color: #1A5276 !important; } </style>""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.title("🏦 古灵阁实战柜台")
     target_code = st.text_input("股票代码", value="601898").strip()
     capital = st.number_input("拟压仓资金", value=100000)
     auto_run = st.toggle("开启实时审计 (5s)", value=True)
-    st.divider()
-    st.write(f"🕒 **北京时间: {get_now_china().strftime('%H:%M:%S')}**")
     if st.button("强制重启审计内核"):
         st.session_state.clear()
         st.rerun()
@@ -169,21 +157,20 @@ try:
                 
                 c3.metric("加权支撑线", f"¥{res['p_sup']}", "稳定" if res["is_stable"] else "波动")
                 
-                # --- 增加力竭可视化看板 ---
                 st.divider()
                 i1, i2, i3 = st.columns(3)
-                i1.write(f"📊 **买卖力量比 (OBR): {res['ob_ratio']}**")
-                i2.write(f"📉 **成交量标准差 (力竭度): {res['vol_std']}**")
-                ex_status = "✅ 卖压力竭 (量化收手)" if res["is_exhausted"] else "🔄 动能交换中"
+                i1.metric("买卖力量比 (OBR)", res['ob_ratio'])
+                i2.metric("力竭度 (Vol Std)", res['vol_std'])
+                ex_status = "✅ 卖压力竭" if res["is_exhausted"] else "🔄 动能交换"
                 i3.write(f"🕵️ **状态审计: {ex_status}**")
 
                 st.subheader("🏦 压仓决策建议")
                 if res["score_stable"]:
-                    st.success(f"🔱 指令：【重仓压入】建议规模：¥{capital * 0.4:,.0f}")
+                    st.success(f"🔱 指令：【重仓压入】建议：¥{capital * 0.4:,.0f}")
                 elif res["score"] >= 40:
-                    st.warning(f"🏺 指令：【轻仓试探】建议规模：¥{capital * 0.1:,.0f}")
+                    st.warning(f"🏺 指令：【轻仓试探】建议：¥{capital * 0.1:,.0f}")
                 else:
-                    st.info("📜 指令：【金库待命】目前无显著信号")
+                    st.info("📜 指令：【金库待命】")
     else:
         st.info(f"🌙 目标 [{target_code}] 处于非交易时段。")
 
