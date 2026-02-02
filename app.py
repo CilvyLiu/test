@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
-# ===================== 0. 权限与内存劫持 (必须在 import ef 之前) =====================
+# ===================== 0. 权限与内存劫持 =====================
 fake_home = Path("/tmp/gringotts_data")
 fake_home.mkdir(parents=True, exist_ok=True)
 
@@ -22,12 +22,22 @@ if 'efinance.config' not in sys.modules:
 import efinance as ef
 
 # ===================== 1. 时区与状态初始化 =====================
-# 强制定义东八区，防止云端服务器 UTC 时间干扰决策
 TZ_CHINA = timezone(timedelta(hours=8))
 
 def get_now_china():
     """获取当前的东八区北京时间"""
     return datetime.now(timezone.utc).astimezone(TZ_CHINA)
+
+def is_trading_time():
+    """判断当前是否为 A 股交易时段 (09:15-11:30, 13:00-15:00)"""
+    now = get_now_china()
+    # 排除周六周日
+    if now.weekday() >= 5: return False
+    
+    hm = now.hour * 100 + now.minute
+    morning = 915 <= hm <= 1130
+    afternoon = 1300 <= hm <= 1500
+    return morning or afternoon
 
 def init_vault():
     state_keys = {
@@ -66,7 +76,8 @@ def gringotts_kernel(quote, df_bids):
     curr_vol = safe_float(quote['成交量'])
     v_delta = curr_vol - st.session_state.prev_vol
     st.session_state.prev_vol = curr_vol
-    actual_v_delta = v_delta if 100 < v_delta < 500000 else 0 
+    # 正常分时增量判定
+    actual_v_delta = v_delta if 0 < v_delta < 1000000 else 0 
 
     # ---- D. 时间回踩确认 (Time Audit) ----
     is_time_confirmed = False
@@ -100,7 +111,7 @@ def gringotts_kernel(quote, df_bids):
     return round(p_sup, 2), total_score, is_stable, (s_score, f_score, t_score), score_stable
 
 # ===================== 3. UI 界面层 =====================
-st.set_page_config(page_title="Gringotts Final v6.0", layout="wide")
+st.set_page_config(page_title="Gringotts Final v6.1", layout="wide")
 
 with st.sidebar:
     st.title("🏦 古灵阁实战柜台")
@@ -110,66 +121,76 @@ with st.sidebar:
     st.divider()
     st.write(f"🕒 **时区: 北京时间 (CST)**")
     st.write(f"{get_now_china().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # 强制手动刷新按钮（应对 API 卡死）
+    if st.button("强制重启审计内核"):
+        st.session_state.clear()
+        st.rerun()
 
 main_container = st.empty()
 
-# ===================== 4. 稳健获取与容错逻辑 =====================
+# ===================== 4. 稳健获取与逻辑修复 =====================
 try:
-    # 第一层：尝试构造带市场前缀的代码
+    # 核心修复点：优先判断是否在交易时间，而非优先判断价格
+    trading_active = is_trading_time()
+
     symbol = target_code.strip()
     full_code = symbol
     if "." not in symbol and len(symbol) == 6:
         full_code = f"1.{symbol}" if symbol.startswith('6') else f"0.{symbol}"
 
-    # 第二层：静默探测数据源
     df = None
     try:
         df = ef.stock.get_realtime_quotes([full_code])
     except:
-        # 如果带前缀报错，尝试原始代码探测
         try:
             df = ef.stock.get_realtime_quotes([symbol])
         except:
             df = None
 
-    # 第三层：核心判定 - 是否有实时数据流入且价格大于0
-    if df is not None and not df.empty and safe_float(df.iloc[0]['最新价']) > 0:
-        quote = df.iloc[0]
-        curr_p = safe_float(quote['最新价'])
-        bids = pd.DataFrame([{'价格':safe_float(quote[f'买价{i}']), '数量':safe_float(quote[f'买量{i}'])} for i in range(1,6)])
-        
-        # 执行审计
-        p_sup, score, is_stable, sub_scores, score_stable = gringotts_kernel(quote, bids)
-
+    # 修改逻辑：如果在交易时间内，即使 df 暂时异常，也显示 [Active] 状态
+    if trading_active:
         with main_container.container():
-            c1, c2, c3 = st.columns([1,2,1])
-            c1.metric("市场报价", f"¥{curr_p}", f"{quote.get('涨跌幅', '--')}%")
-            
-            # 冷却判定
-            if time.time() < st.session_state.cooldown_until:
-                cd_dt = datetime.fromtimestamp(st.session_state.cooldown_until, tz=timezone.utc).astimezone(TZ_CHINA)
-                c2.error(f"🛡️ 冷却保护中... 重启时间: {cd_dt.strftime('%H:%M:%S')}")
+            if df is not None and not df.empty:
+                quote = df.iloc[0]
+                curr_p = safe_float(quote['最新价'])
+                
+                # 如果是 09:30 刚开盘价格还没出来的容错处理
+                if curr_p <= 0:
+                    st.warning(f"🏦 审计已激活：等待 [{target_code}] 开盘首笔成交流入...")
+                else:
+                    bids = pd.DataFrame([{'价格':safe_float(quote[f'买价{i}']), '数量':safe_float(quote[f'买量{i}'])} for i in range(1,6)])
+                    p_sup, score, is_stable, sub_scores, score_stable = gringotts_kernel(quote, bids)
+
+                    c1, c2, c3 = st.columns([1,2,1])
+                    c1.metric("市场报价", f"¥{curr_p}", f"{quote.get('涨跌幅', '--')}%")
+                    
+                    if time.time() < st.session_state.cooldown_until:
+                        cd_dt = datetime.fromtimestamp(st.session_state.cooldown_until, tz=timezone.utc).astimezone(TZ_CHINA)
+                        c2.error(f"🛡️ 冷却保护中... 重启时间: {cd_dt.strftime('%H:%M:%S')}")
+                    else:
+                        color = "green" if score_stable else ("yellow" if score >= 40 else "red")
+                        c2.markdown(f"<h1 style='text-align:center; color:{color};'>审计意图评分: {score}</h1>", unsafe_allow_html=True)
+                    
+                    c3.metric("加权支撑线", f"¥{p_sup}", "稳定" if is_stable else "波动")
+                    st.divider()
+                    
+                    sc1, sc2, sc3 = st.columns(3)
+                    sc1.write(f"📊 结构: {sub_scores[0]}/30")
+                    sc2.write(f"💧 增量: {sub_scores[1]}/30")
+                    sc3.write(f"⏳ 验证: {sub_scores[2]}/40")
+                    
+                    st.subheader("🏦 压仓决策建议")
+                    if score_stable:
+                        st.success(f"🔥 指令：【重仓压入】建议规模：¥{capital * 0.4:,.0f}")
+                    elif score >= 40:
+                        st.warning(f"🟡 指令：【轻仓试探】建议规模：¥{capital * 0.1:,.0f}")
+                    else:
+                        st.info("⚪ 指令：【金库待命】目前无显著信号")
             else:
-                color = "green" if score_stable else ("yellow" if score >= 40 else "red")
-                c2.markdown(f"<h1 style='text-align:center; color:{color};'>审计意图评分: {score}</h1>", unsafe_allow_html=True)
-            
-            c3.metric("加权支撑线", f"¥{p_sup}", "稳定" if is_stable else "波动")
-            st.divider()
-            
-            sc1, sc2, sc3 = st.columns(3)
-            sc1.write(f"📊 结构: {sub_scores[0]}/30")
-            sc2.write(f"💧 增量: {sub_scores[1]}/30")
-            sc3.write(f"⏳ 验证: {sub_scores[2]}/40")
-            
-            st.subheader("🏦 压仓决策建议")
-            if score_stable:
-                st.success(f"🔥 指令：【重仓压入】建议规模：¥{capital * 0.4:,.0f}")
-            elif score >= 40:
-                st.warning(f"🟡 指令：【轻仓试探】建议规模：¥{capital * 0.1:,.0f}")
-            else:
-                st.info("⚪ 指令：【金库待命】目前无显著信号")
+                st.error(f"⚠️ 正在尝试连接 [{target_code}] 数据通道...")
     else:
-        # 非交易日或接口报错时的静默休眠模式
+        # 非交易时间逻辑
         with main_container.container():
             st.info(f"🌙 目标 [{target_code}] 处于非交易时段。")
             st.markdown(f"""
