@@ -23,7 +23,7 @@ def is_trading_time():
 def init_vault():
     state_keys = {
         "support_cache": [], "score_cache": [], "rebound_cache": [],
-        "v_delta_cache": [0.0]*5, # 存储成交量增量历史
+        "v_delta_cache": [0.0]*5, 
         "prev_vol": 0.0, "hit_support": False, "cooldown_until": 0.0
     }
     for key, val in state_keys.items():
@@ -43,7 +43,7 @@ def gringotts_kernel(quote, df_bids, df_asks):
     curr_p = safe_float(quote['最新价'])
     curr_time = time.time()
 
-    # --- 1. 支撑计算 ---
+    # --- 1. 支撑计算 (权重审计) ---
     top_bids = df_bids.head(3).copy()
     top_bids['pf'] = top_bids['价格'].apply(safe_float)
     top_bids['vf'] = top_bids['数量'].apply(safe_float)
@@ -55,20 +55,22 @@ def gringotts_kernel(quote, df_bids, df_asks):
 
     # --- 2. 动能审计 (顺势逻辑) ---
     curr_vol = safe_float(quote['成交量'])
-    v_delta = curr_vol - st.session_state.prev_vol if st.session_state.prev_vol > 0 else 0.0
+    # 修复：强制转换为 float 运算，防范接口返回字符串导致的审计异常
+    v_delta = curr_vol - float(st.session_state.prev_vol) if float(st.session_state.prev_vol) > 0 else 0.0
     st.session_state.prev_vol = curr_vol
     
     st.session_state.v_delta_cache.append(v_delta)
     st.session_state.v_delta_cache = st.session_state.v_delta_cache[-5:]
     
-    # 计算买卖盘厚度比 (OBR)
+    # 计算买卖盘厚度比 (OBR) - 识别量化冰山单
     bid_total = df_bids['数量'].apply(safe_float).sum()
     ask_total = df_asks['数量'].apply(safe_float).sum()
     obr = bid_total / ask_total if ask_total > 0 else 1.0
     
-    # 计算成交稳定性 (力竭度)
+    # 计算成交稳定性 (力竭度) - 判断卖盘是否枯竭
     vol_std = np.std(st.session_state.v_delta_cache)
-    is_exhausted = vol_std < 500 and v_delta < 1000 # 成交趋于死寂即为力竭
+    # 定义力竭：波动率极低且单次增量萎缩
+    is_exhausted = vol_std < 500 and v_delta < 1000 
 
     # --- 3. 确认逻辑 ---
     is_time_confirmed = False
@@ -89,7 +91,7 @@ def gringotts_kernel(quote, df_bids, df_asks):
         st.session_state.cooldown_until = curr_time + 300
 
     s_score = 30 if is_stable else 0
-    f_score = 30 if (v_delta > 500 or is_exhausted) else 0 # 力竭横盘也算防御得分
+    f_score = 30 if (v_delta > 500 or is_exhausted) else 0 
     t_score = 40 if is_time_confirmed else 0
     total_score = s_score + f_score + t_score
 
@@ -165,7 +167,6 @@ try:
                 
                 c3.metric("加权支撑线", f"¥{res['p_sup']}", "稳定" if res["is_stable"] else "波动")
                 
-                # --- 力竭审计看板 ---
                 st.divider()
                 i1, i2, i3 = st.columns(3)
                 i1.metric("买卖力量比 (OBR)", res['obr'], help="大于1.5说明买盘强于卖盘")
