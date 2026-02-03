@@ -18,7 +18,7 @@ def init_vault(target_code):
         st.session_state.prev_vol_cumulative = 0.0
         st.session_state.avg_vol_ema = 0.0
         st.session_state.cvd = 0.0
-        st.toast(f"🏛️ v10.0 投行高频审计内核挂载: {target_code}")
+        st.toast(f"🏛️ v10.5 挂单执行内核已挂载: {target_code}")
 
 def safe_float(x, default=0.0):
     try: return float(str(x).replace(',', ''))
@@ -27,103 +27,88 @@ def safe_float(x, default=0.0):
 # ===================== 1. 投行高阶工具箱 =====================
 
 def calculate_entropy(volumes):
-    """数理逻辑：分布熵。用于识别盘口挂单是否由量化机器人操纵。"""
     probs = volumes / (sum(volumes) + 1e-9)
     return -np.sum(probs * np.log(probs + 1e-9))
 
 def get_market_metrics(prices, imbs, cvds):
     if len(prices) < 20: return 0.2, 0.2, 0.0, 0.0, 0.0
-    
-    # 1. 动态权重 Alpha (ER效率比)
     change = abs(prices[-1] - prices[-15])
     vol = sum(abs(np.diff(prices[-15:]))) + 1e-9
     alpha = np.clip((change / vol) * 0.4 + 0.1, 0.1, 0.5)
-    
-    # 2. 动态委比阈值
     imb_thresh = np.std(imbs) * 2.0 if len(imbs) > 10 else 0.2
-    
-    # 3. 价格斜率
     slope_bp = (np.polyfit(np.arange(10), prices[-10:], 1)[0]) / (prices[-1] + 1e-9)
-    
-    # 4. CVD 趋势降噪 (取15 tick窗口)
     cvd_trend = np.polyfit(np.arange(len(cvds[-15:])), cvds[-15:], 1)[0] if len(cvds) >= 15 else 0
-    
-    # 5. 波动率指数 (用于仓位缩减)
     atr_sim = np.std(np.diff(prices[-20:])) / (prices[-1] + 1e-9)
-    
     return alpha, imb_thresh, slope_bp, cvd_trend, atr_sim
 
-# ===================== 2. 审计内核 v10.0 =====================
+# ===================== 2. 审计内核 v10.5 (增加精确挂单逻辑) =====================
 def institutional_kernel(quote, df_bids, df_asks):
     curr_p = safe_float(quote['最新价'])
-    curr_cum_vol = safe_float(quote['成交量'])
     
-    # A. 基础压入
     st.session_state.price_history.append(curr_p)
     st.session_state.price_history = st.session_state.price_history[-100:]
     
     bid_v_list = df_bids['数量'].apply(safe_float).values
     ask_v_list = df_asks['数量'].apply(safe_float).values
-    bid_v, ask_v = bid_v_list.sum(), ask_v_list.sum()
+    bid_p_list = df_bids['价格'].apply(safe_float).values
+    ask_p_list = df_asks['价格'].apply(safe_float).values
     
+    bid_v, ask_v = bid_v_list.sum(), ask_v_list.sum()
     imbalance = (bid_v - ask_v) / (bid_v + ask_v + 1e-9)
     st.session_state.imb_history.append(imbalance)
-    st.session_state.imb_history = st.session_state.imb_history[-100:]
     
-    # B. 高阶参数计算
     alpha, dyn_thresh, slope_bp, cvd_trend, vol_idx = get_market_metrics(
         st.session_state.price_history, st.session_state.imb_history, st.session_state.cvd_history
     )
     
-    # C. 挂单分布熵分析
-    ask_entropy = calculate_entropy(ask_v_list)
-    bid_entropy = calculate_entropy(bid_v_list)
-    
-    # D. CVD 动量平滑
+    ask_ent = calculate_entropy(ask_v_list)
+    bid_ent = calculate_entropy(bid_v_list)
     st.session_state.cvd = (1 - alpha) * st.session_state.cvd + alpha * (bid_v - ask_v)
     st.session_state.cvd_history.append(st.session_state.cvd)
-    st.session_state.cvd_history = st.session_state.cvd_history[-100:]
     
-    # E. 评分决策矩阵 (改进版)
+    # --- 核心：挂单位计算逻辑 ---
+    
+    # 1. 最低吸入抄底位 (Entry Price)
+    # 逻辑：结合支撑位和斜率补偿。若下跌趋势快(slope_bp < 0)，挂单位在买一的基础上往下沉。
     p_sup = np.percentile(st.session_state.price_history[-30:], 20) if len(st.session_state.price_history)>=30 else curr_p
-    p_res = np.average(df_asks['价格'].apply(safe_float).values, weights=ask_v_list) if ask_v > 0 else curr_p
-    p_stop = p_sup * 0.995 # 动态止损线
+    slope_buffer = abs(slope_bp) * curr_p * 2 # 动态缓冲
+    p_entry = min(bid_p_list[0], p_sup) - (0.01 if slope_bp < 0 else -0.01)
     
-    # --- 买方评分 ---
+    # 2. 最高止盈挂单位 (TP Price)
+    # 逻辑：若卖盘熵低(假压单)，说明卖一是量化拦路，建议挂在卖一上方 1-2个tick (卖二附近)
+    if ask_ent < 1.0:
+        p_tp = ask_p_list[0] + 0.02 # 突破挂单
+    else:
+        # 若是真实抛压，建议挂在卖一位置，甚至在卖一前逃逸
+        p_tp = ask_p_list[0]
+        
+    p_stop = p_sup * 0.995
+
+    # 3. 评分
     b_score = 0
     if curr_p > p_stop:
-        if curr_p <= p_sup * 1.003: b_score += 20
-        if imbalance > dyn_thresh: b_score += 20
-        if slope_bp > 0: b_score += 20
-        if cvd_trend > 0: b_score += 20
-        if bid_entropy > 1.2: b_score += 20 # 买盘分布均匀，真实接盘力强
+        if curr_p <= p_entry * 1.002: b_score += 30
+        if imbalance > dyn_thresh: b_score += 30
+        if cvd_trend > 0: b_score += 40
         
-    # --- 卖方评分 (强化意图识别) ---
     s_score = 0
-    if curr_p >= p_res * 0.997:
-        s_score += 20
-        if imbalance < -dyn_thresh: s_score += 20
-        if cvd_trend < 0 and slope_bp > 0: s_score += 40 # 典型诱多背离
-        if ask_entropy < 0.8: s_score -= 30 # 卖盘极度集中，判定为虚假压单（拦截）
+    if curr_p >= p_tp * 0.998:
+        s_score += 30
+        if cvd_trend < 0 and slope_bp > 0: s_score += 50
+        if ask_ent < 0.8: s_score -= 20
 
-    # F. 仓位管理 (波动率调节)
-    vol_adj = np.clip(1 - vol_idx * 100, 0.5, 1.0) # 波动越大，仓位倍率越低
-    pos_percent = 0
-    if b_score >= 80: pos_percent = 80 * vol_adj
-    elif b_score >= 60: pos_percent = 40 * vol_adj
-    
-    if s_score >= 80: pos_percent = -100 # 信号清仓
-    elif s_score >= 60: pos_percent = -50  # 减仓
+    vol_adj = np.clip(1 - vol_idx * 100, 0.5, 1.0)
+    pos_percent = (80 if b_score >= 80 else 40 if b_score >= 60 else 0) * vol_adj
+    if s_score >= 80: pos_percent = -100
 
     return {
-        "p_sup": p_sup, "p_res": p_res, "p_stop": p_stop,
+        "p_entry": p_entry, "p_tp": p_tp, "p_stop": p_stop,
         "curr_p": curr_p, "b_score": b_score, "s_score": s_score,
-        "pos_percent": pos_percent, "ask_ent": ask_entropy,
-        "cvd_t": cvd_trend, "vol_idx": vol_idx
+        "pos_percent": pos_percent, "ask_ent": ask_ent, "cvd_t": cvd_trend
     }
 
 # ===================== 3. UI 投行面板 =====================
-st.set_page_config(page_title="Institutional Vision v10.0", layout="wide")
+st.set_page_config(page_title="Institutional Vision v10.5", layout="wide")
 
 def fetch_data(code):
     try:
@@ -136,39 +121,41 @@ def fetch_data(code):
     except: return None
 
 with st.sidebar:
-    st.title("🏛️ Vault v10.0")
+    st.title("🏛️ Trader Vault")
     target_code = st.text_input("代码", value="601898")
     init_vault(target_code)
-    if st.button("RESET VAULT"): st.session_state.clear(); st.rerun()
+    st.divider()
+    st.metric("CVD 动量", f"{st.session_state.cvd:.0f}")
+    if st.button("RESET"): st.session_state.clear(); st.rerun()
 
 data = fetch_data(target_code)
 if data:
     res = institutional_kernel(data, data['买盘'], data['卖盘'])
     
-    # 顶部监控区
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("执行建议", f"{res['pos_percent']:.0f}%", "仓位权重")
-    c2.metric("卖盘熵值", f"{res['ask_ent']:.2f}", "低熵=假压单" if res['ask_ent'] < 1.0 else "高熵=真抛压")
-    c3.metric("资金动量趋势", f"{res['cvd_t']:.2f}", "降噪CVD")
-    c4.metric("动态止损价", f"¥{res['p_stop']:.2f}")
+    # --- 交易执行核心区 ---
+    st.write("### 🎯 精确挂单决策审计")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("止盈最高挂单位", f"¥{res['p_tp']:.2f}", "卖一溢价位")
+    c2.metric("抄底最低吸入位", f"¥{res['p_entry']:.2f}", "趋势补偿位")
+    c3.metric("风险止损线", f"¥{res['p_stop']:.2f}", delta_color="inverse")
 
     st.divider()
     
-    # 意图评分仪表盘
-    l, r = st.columns(2)
-    with l:
-        st.write("🌲 **买方多维意图评分**")
-        st.progress(min(res['b_score']/100, 1.0), text=f"Score: {int(res['b_score'])}")
-    with r:
-        st.write("🔥 **卖方意图与背离审计**")
-        st.progress(min(res['s_score']/100, 1.0), text=f"Score: {int(res['s_score'])}")
+    # 仓位与评分
+    m1, m2 = st.columns([1, 2])
+    with m1:
+        st.metric("建议执行仓位", f"{res['pos_percent']:.0f}%")
+    with m2:
+        st.write(f"买/卖评分动态: {int(res['b_score'])} / {int(res['s_score'])}")
+        st.progress(max(res['b_score'], res['s_score'])/100)
 
-    # 交易员观测
-    with st.expander("👁️ 原始深度与熵值分布"):
-        st.write(f"当前波动率系数: {res['vol_idx']:.5f}")
-        col1, col2 = st.columns(2)
-        col1.table(data['卖盘'][::-1])
-        col2.table(data['买盘'])
+    
+
+    with st.expander("👁️ 盘口深度审计记录"):
+        st.write(f"卖盘分布熵: {res['ask_ent']:.2f} (熵低说明量化拦截严重)")
+        col_ask, col_bid = st.columns(2)
+        col_ask.table(data['卖盘'][::-1])
+        col_bid.table(data['买盘'])
 
 time.sleep(5)
 st.rerun()
