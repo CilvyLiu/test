@@ -1,14 +1,12 @@
 import os
-import sys
 import time
 import requests
-from pathlib import Path
-from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 import streamlit as st
+from datetime import datetime, timedelta, timezone
 
-# ===================== 0. 环境初始化 =====================
+# ===================== 0. 环境底座 =====================
 TZ_CHINA = timezone(timedelta(hours=8))
 
 def get_now_china():
@@ -22,9 +20,17 @@ def is_trading_time():
 
 def init_vault():
     state_keys = {
-        "support_cache": [], "score_cache": [], "rebound_cache": [],
-        "v_delta_cache": [0.0]*5, 
-        "prev_vol": 0.0, "hit_support": False, "cooldown_until": 0.0
+        "price_history": [],      
+        "volume_history": [],     
+        "sup_history": [],        # [补丁①] 支撑历史，用于时间一致性
+        "prev_vol_cumulative": 0.0, 
+        "risk_lock_active": False,
+        "lock_timestamp": 0.0,     
+        "last_valid_vol": 0.0005,  
+        "avg_vol_ema": 0.0,        
+        "last_sell_time": 0.0,
+        "last_buy_time": 0.0,      # [补丁③] 买入动作钝化记忆
+        "break_count": 0           
     }
     for key, val in state_keys.items():
         if key not in st.session_state:
@@ -38,155 +44,157 @@ def safe_float(x, default=0.0):
         return float(x)
     except: return default
 
-# ===================== 2. 核心审计引擎 (集成力竭监测) =====================
+# ===================== 1. 核心加固工具 =====================
+
+def safe_weighted_avg(df, price_col, vol_col, fallback):
+    try:
+        p = df[price_col].apply(safe_float).values
+        v = df[vol_col].apply(safe_float).values
+        v_sum = v.sum()
+        return np.average(p, weights=v) if v_sum > 0 else fallback
+    except: return fallback
+
+def get_filtered_volatility(prices):
+    if len(prices) < 5: return st.session_state.last_valid_vol
+    returns = np.diff(np.log(np.array(prices)))
+    valid_returns = returns[np.abs(returns) > 1e-6]
+    if len(valid_returns) < 3: return st.session_state.last_valid_vol
+    curr_vol = np.std(valid_returns)
+    st.session_state.last_valid_vol = curr_vol
+    return curr_vol
+
+# ===================== 2. 审计内核 v8.4 =====================
 def gringotts_kernel(quote, df_bids, df_asks):
     curr_p = safe_float(quote['最新价'])
-    curr_time = time.time()
-
-    # --- 1. 支撑计算 (权重审计) ---
-    top_bids = df_bids.head(3).copy()
-    top_bids['pf'] = top_bids['价格'].apply(safe_float)
-    top_bids['vf'] = top_bids['数量'].apply(safe_float)
-    p_sup = np.average(top_bids['pf'], weights=top_bids['vf']) if top_bids['vf'].sum() > 0 else curr_p
-
-    st.session_state.support_cache.append(p_sup)
-    st.session_state.support_cache = st.session_state.support_cache[-5:]
-    is_stable = (max(st.session_state.support_cache) - min(st.session_state.support_cache)) <= 0.02 if len(st.session_state.support_cache) >= 3 else False
-
-    # --- 2. 动能审计 (顺势逻辑) ---
-    curr_vol = safe_float(quote['成交量'])
-    # 修复：强制转换为 float 运算，防范接口返回字符串导致的审计异常
-    v_delta = curr_vol - float(st.session_state.prev_vol) if float(st.session_state.prev_vol) > 0 else 0.0
-    st.session_state.prev_vol = curr_vol
+    curr_cum_vol = safe_float(quote['成交量'])
+    now_ts = time.time()
     
-    st.session_state.v_delta_cache.append(v_delta)
-    st.session_state.v_delta_cache = st.session_state.v_delta_cache[-5:]
+    # --- A. 数据清洗与量能归一化 ---
+    if curr_cum_vol < st.session_state.prev_vol_cumulative:
+        st.session_state.prev_vol_cumulative = curr_cum_vol
+        tick_vol = 0
+    else:
+        tick_vol = max(0, curr_cum_vol - st.session_state.prev_vol_cumulative)
+    st.session_state.prev_vol_cumulative = curr_cum_vol
     
-    # 计算买卖盘厚度比 (OBR) - 识别量化冰山单
-    bid_total = df_bids['数量'].apply(safe_float).sum()
-    ask_total = df_asks['数量'].apply(safe_float).sum()
-    obr = bid_total / ask_total if ask_total > 0 else 1.0
+    st.session_state.price_history.append(curr_p)
+    st.session_state.price_history = st.session_state.price_history[-30:]
     
-    # 计算成交稳定性 (力竭度) - 判断卖盘是否枯竭
-    vol_std = np.std(st.session_state.v_delta_cache)
-    # 定义力竭：波动率极低且单次增量萎缩
-    is_exhausted = vol_std < 500 and v_delta < 1000 
+    volatility = get_filtered_volatility(st.session_state.price_history)
+    
+    # EMA 量能归一化
+    alpha = 0.2
+    st.session_state.avg_vol_ema = alpha * tick_vol + (1 - alpha) * st.session_state.avg_vol_ema if st.session_state.avg_vol_ema > 0 else tick_vol
+    vol_ratio = min(tick_vol / (st.session_state.avg_vol_ema + 1e-9), 10.0)
 
-    # --- 3. 确认逻辑 ---
-    is_time_confirmed = False
-    if curr_p > 0 and curr_p <= p_sup * 1.002:
-        st.session_state.hit_support = True
+    # --- B. 支撑一致性确认 [补丁①] ---
+    weighted_bid_p = safe_weighted_avg(df_bids, '价格', '数量', fallback=curr_p)
+    st.session_state.sup_history.append(weighted_bid_p)
+    st.session_state.sup_history = st.session_state.sup_history[-5:] # 5个tick的一致性窗口
+    
+    # 使用中位数平滑掉瞬时撤单干扰 (防盘口欺骗)
+    stable_bid_sup = np.median(st.session_state.sup_history)
+    struct_sup = np.percentile(st.session_state.price_history[-20:], 20) if len(st.session_state.price_history) >= 20 else stable_bid_sup
+    
+    p_sup = min(stable_bid_sup, struct_sup)
+    p_res = safe_weighted_avg(df_asks, '价格', '数量', fallback=curr_p)
+    
+    # --- C. 结构化风控与带量确认 [补丁②] ---
+    # 击穿判定：跌破支撑 且 必须有一定量能支撑 (vol_ratio > 0.6)
+    if curr_p < p_sup * 0.996 and vol_ratio > 0.6:
+        st.session_state.break_count += 1
+    else:
+        st.session_state.break_count = max(0, st.session_state.break_count - 1)
 
-    if st.session_state.hit_support:
-        st.session_state.rebound_cache.append((curr_time, curr_p))
-        st.session_state.rebound_cache = [x for x in st.session_state.rebound_cache if curr_time - x[0] <= 30]
-        if len(st.session_state.rebound_cache) >= 3:
-            time_diff = st.session_state.rebound_cache[-1][0] - st.session_state.rebound_cache[0][0]
-            if time_diff >= 9 and min([x[1] for x in st.session_state.rebound_cache]) > p_sup * 0.995:
-                is_time_confirmed = True
+    lock_trigger = (st.session_state.break_count >= 2) or (volatility > 0.003)
+    min_lock_sec = max(10, int(60 * (volatility / 0.002)))
+    
+    if lock_trigger:
+        st.session_state.risk_lock_active = True
+        st.session_state.lock_timestamp = now_ts
+    else:
+        if st.session_state.risk_lock_active and (now_ts - st.session_state.lock_timestamp < min_lock_sec):
+            pass 
+        else:
+            st.session_state.risk_lock_active = False
 
-    if curr_p > 0 and curr_p < p_sup * 0.98:
-        st.session_state.hit_support = False
-        st.session_state.rebound_cache = []
-        st.session_state.cooldown_until = curr_time + 300
-
-    s_score = 30 if is_stable else 0
-    f_score = 30 if (v_delta > 500 or is_exhausted) else 0 
-    t_score = 40 if is_time_confirmed else 0
-    total_score = s_score + f_score + t_score
-
-    st.session_state.score_cache.append(total_score)
-    st.session_state.score_cache = st.session_state.score_cache[-5:]
-    score_stable = len(st.session_state.score_cache) >= 3 and min(st.session_state.score_cache[-3:]) >= 70
-
+    # --- D. 对称化评分与买入钝化 [补丁③] ---
+    ret_trend = (curr_p / st.session_state.price_history[-5] - 1) if len(st.session_state.price_history) >= 5 else 0
+    
+    # 卖方评分
+    s_score = 0
+    if curr_p >= p_res: s_score += 40
+    if curr_p >= p_res * (1 + 2.5 * volatility): s_score += 40
+    if vol_ratio > 4.0: s_score += 20 
+    # 卖出钝化记忆
+    if now_ts - st.session_state.last_sell_time < 60: s_score *= 0.6
+    if s_score >= 70: st.session_state.last_sell_time = now_ts
+    
+    # 买方评分
+    b_score = 0
+    if not st.session_state.risk_lock_active and ret_trend > -0.0005 and volatility < 0.002:
+        if abs(curr_p - p_sup)/curr_p < 0.0015: b_score += 40 
+        if vol_ratio < 0.8: b_score += 40 
+        if s_score < 20: b_score += 20 
+    
+    # 买入动作钝化 [补丁③]
+    if now_ts - st.session_state.last_buy_time < 60:
+        b_score *= 0.7 
+    if b_score >= 70: st.session_state.last_buy_time = now_ts
+        
     return {
-        "p_sup": round(p_sup, 2), "score": total_score, "is_stable": is_stable,
-        "score_stable": score_stable, "obr": round(obr, 2), "vol_std": round(vol_std, 1),
-        "is_exhausted": is_exhausted
+        "p_sup": p_sup, "p_res": p_res, "vol_ratio": vol_ratio,
+        "volatility_bp": volatility * 10000,
+        "buy_score": b_score, "sell_score": s_score,
+        "is_locked": st.session_state.risk_lock_active,
+        "lock_time_left": max(0, int(min_lock_sec - (now_ts - st.session_state.lock_timestamp))),
+        "break_count": st.session_state.break_count
     }
 
-# ===================== 3. UI 界面层 =====================
-st.set_page_config(page_title="Gringotts Final v6.5", layout="wide")
+# ===================== 3. UI 交互层 =====================
+st.set_page_config(page_title="Gringotts v8.4 Final Integrity", layout="wide")
 
-st.markdown("""
-    <style>
-    .reportview-container .main .block-container { color: #1A5276; }
-    h1, h2, h3 { color: #1A5276 !important; }
-    .stMetric { background-color: #f8f9fb; padding: 15px; border-radius: 10px; border-left: 5px solid #1A5276; }
-    </style>
-    """, unsafe_allow_html=True)
-
-with st.sidebar:
-    st.title("🏦 古灵阁实战柜台")
-    target_code = st.text_input("股票代码 (如 601898)", value="601898").strip()
-    capital = st.number_input("拟压仓资金", value=100000)
-    auto_run = st.toggle("开启实时审计 (5s)", value=True)
-    st.divider()
-    st.write(f"🕒 **北京时间: {get_now_china().strftime('%H:%M:%S')}**")
-    if st.button("强制重启审计内核"):
-        st.session_state.clear()
-        st.rerun()
-
-main_container = st.empty()
-
-def fetch_tencent_data(code):
-    if not code or len(code) < 6: return None
+def fetch_data(code):
     try:
-        prefix = "sh" if code.startswith('6') else "sz"
-        url = f"http://qt.gtimg.cn/q={prefix}{code}"
-        r = requests.get(url, timeout=2)
-        if r.status_code != 200: return None
-        parts = r.text.split('~')
-        if len(parts) < 30: return None
-        return {
-            '最新价': parts[3], '涨跌幅': parts[32], '成交量': parts[6],
-            '买1': (parts[9], parts[10]), '买2': (parts[11], parts[12]), '买3': (parts[13], parts[14]), '买4': (parts[15], parts[16]), '买5': (parts[17], parts[18]),
-            '卖1': (parts[19], parts[20]), '卖2': (parts[21], parts[22]), '卖3': (parts[23], parts[24]), '卖4': (parts[25], parts[26]), '卖5': (parts[27], parts[28]),
-        }
+        pre = "sh" if code.startswith('6') else "sz"
+        r = requests.get(f"http://qt.gtimg.cn/q={pre}{code}", timeout=1.5)
+        p = r.text.split('~')
+        return {'最新价':p[3], '涨跌幅':p[32], '成交量':p[6], 
+                '买盘':pd.DataFrame([{'价格':p[9+i*2], '数量':p[10+i*2]} for i in range(5)]),
+                '卖盘':pd.DataFrame([{'价格':p[19+i*2], '数量':p[20+i*2]} for i in range(5)])}
     except: return None
 
-# ===================== 4. 执行逻辑 =====================
-try:
-    if is_trading_time():
-        with main_container.container():
-            data = fetch_tencent_data(target_code)
-            if data:
-                bids = pd.DataFrame([{'价格': data[f'买{i}'][0], '数量': data[f'买{i}'][1]} for i in range(1,6)])
-                asks = pd.DataFrame([{'价格': data[f'卖{i}'][0], '数量': data[f'卖{i}'][1]} for i in range(1,6)])
-                
-                res = gringotts_kernel(data, bids, asks)
+with st.sidebar:
+    st.title("🏦 Gringotts v8.4")
+    target_code = st.text_input("代码", value="601898")
+    if st.button("Reset State"): st.session_state.clear(); st.rerun()
 
-                c1, c2, c3 = st.columns([1,2,1])
-                c1.metric("市场报价", f"¥{data['最新价']}", f"{data['涨跌幅']}%")
-                
-                if time.time() < st.session_state.cooldown_until:
-                    c2.error("🛡️ 冷却保护中...")
-                else:
-                    color = "#145A32" if res["score_stable"] else ("#9A7D0A" if res["score"] >= 40 else "#1A5276")
-                    c2.markdown(f"<h1 style='text-align:center; color:{color};'>审计评分: {res['score']}</h1>", unsafe_allow_html=True)
-                
-                c3.metric("加权支撑线", f"¥{res['p_sup']}", "稳定" if res["is_stable"] else "波动")
-                
-                st.divider()
-                i1, i2, i3 = st.columns(3)
-                i1.metric("买卖力量比 (OBR)", res['obr'], help="大于1.5说明买盘强于卖盘")
-                i2.metric("力竭度 (Vol Std)", res['vol_std'], help="数值越小说明成交越死寂，空头越力竭")
-                ex_status = "✅ 卖压力竭" if res["is_exhausted"] else "🔄 动能交换"
-                i3.subheader(f"状态：{ex_status}")
+if is_trading_time():
+    data = fetch_data(target_code)
+    if data:
+        res = gringotts_kernel(data, data['买盘'], data['卖盘'])
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Price", f"¥{data['最新价']}", f"{data['涨跌幅']}%")
+        
+        lock_label = f"LOCK ({res['lock_time_left']}s)" if res['is_locked'] else "🟢 ACTIVE"
+        c2.metric("System Status", lock_label, f"Break: {res['break_count']}")
+        c3.metric("EMA Vol Ratio", f"{res['vol_ratio']:.2f}x", f"{res['volatility_bp']:.1f} bp")
 
-                st.subheader("🏦 压仓决策建议")
-                if res["score_stable"]:
-                    st.success(f"🔱 指令：【重仓压入】建议规模：¥{capital * 0.4:,.0f}")
-                elif res["score"] >= 40:
-                    st.warning(f"🏺 指令：【轻仓试探】建议规模：¥{capital * 0.1:,.0f}")
-                else:
-                    st.info("📜 指令：【金库待命】目前无显著信号")
-    else:
-        st.info(f"🌙 目标 [{target_code}] 处于非交易时段。")
+        st.divider()
+        b_col, s_col = st.columns(2)
+        with b_col:
+            st.markdown("### 🌲 买方审计")
+            if res['is_locked']: st.error("🛡️ 风控保护中")
+            elif res['buy_score'] >= 70: st.success(f"🔱 强烈信号: {res['buy_score']}")
+            else: st.info(f"审计评分: {int(res['buy_score'])}")
+            
+        with s_col:
+            st.markdown("### 🔥 卖方审计")
+            if res['sell_score'] >= 70: st.error(f"🚨 卖出建议: {res['sell_score']}")
+            else: st.write(f"当前抛压: {int(res['sell_score'])}")
+else:
+    st.info("🌙 非交易时段")
 
-    if auto_run:
-        time.sleep(5)
-        st.rerun()
-
-except Exception as e:
-    st.error(f"审计异常: {e}")
+time.sleep(5)
+st.rerun()
