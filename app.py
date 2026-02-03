@@ -112,12 +112,7 @@ def institutional_kernel(quote, df_bids, df_asks):
     if curr_p >= zema and weibi < -10: s_score += 50 # 价格超涨且卖盘拦截
     if total_ask_v > total_bid_v * 1.5: s_score += 50 # 极端拦截压制
 
-    return {
-        "p_floor": p_floor, "p_peak": p_peak, "zvwap": zvwap, "zema": zema,
-        "weibi": weibi, "weicha": weicha, "b_score": b_score, "s_score": s_score,
-        "curr_p": curr_p, "pos_percent": 80 if b_score > 80 else 0
-    }
-# 2.5 盘口厚度与意图审计 (核心：穿透量化挂单)
+    # 2.5 盘口厚度与意图审计 (核心：穿透量化挂单)
     avg_bid_v, avg_ask_v = np.mean(bid_v), np.mean(ask_v)
     
     def get_intent(v, avg_v, side):
@@ -156,13 +151,19 @@ if is_trade_time()[0]:
         res = institutional_kernel(data, data['买盘'], data['卖盘'])
         
         # 第一排：价格与极端位 (高亮显示)
-        st.subheader(f"📊 当前价格: ¥{res['curr_p']} | 获利空间: {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
+        # 1. 计算获利潜能与视觉标记
+        profit_space = (res['p_peak'] / res['curr_p'] - 1) * 100
+        space_color = "🟢" if profit_space > 0 else "🔴"
+        
+        # 2. 增强型标题显示
+        st.subheader(f"📊 当前价格: ¥{res['curr_p']} | {space_color} 获利空间: {profit_space:.2f}%")
+        # 3. 第一排核心指标
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("最低吸入位", f"¥{res['p_floor']:.2f}", "抄底点", delta_color="normal")
         c2.metric("最高获利位", f"¥{res['p_peak']:.2f}", "止盈点", delta_color="inverse")
         c3.metric("机构成本 (ZVWAP)", f"¥{res['zvwap']:.2f}")
         c4.metric("委比 / 委差", f"{res['weibi']:.1f}%", f"{int(res['weicha'])}")
-
+        
         st.divider()
 
         # 第二排：评分与盘口厚度
@@ -176,20 +177,21 @@ if is_trade_time()[0]:
             st.write(f"评分原因：{'触发 ZEMA 压力' if res['s_score']>0 else '持有'}")
 
         st.write(f"🛡️ **ZEMA 基准:** ¥{res['zema']:.2f} | **当前获利空间:** {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
-# --- 补在此处：意图审计细节表格 ---
-       with st.expander("👁️ 盘口意图与挂单审计", expanded=True):
+# --- 修正后的意图审计细节表格 ---
+        with st.expander("👁️ 盘口意图与挂单审计", expanded=True):
             col_a, col_b = st.columns(2)
             with col_a:
                 st.write("卖方盘口 (Ask)")
                 df_a = data['卖盘'].iloc[::-1].copy()
-                df_a['意图'] = res['ask_intents'][::-1]
+                # 确保 kernel 返回了 ask_intents
+                df_a['意图审计'] = res['ask_intents'][::-1]
                 st.table(df_a)
             with col_b:
                 st.write("买方盘口 (Bid)")
                 df_b = data['买盘'].copy()
-                df_b['意图'] = res['bid_intents']
+                # 确保 kernel 返回了 bid_intents
+                df_b['意图审计'] = res['bid_intents']
                 st.table(df_b)
-        # --- 补位结束 ---
     time.sleep(refresh_rate)
     st.rerun()
 else:
