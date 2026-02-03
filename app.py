@@ -32,21 +32,29 @@ def safe_float(x, default=0.0):
     try: return float(str(x).replace(',', ''))
     except: return default
 
-# ===================== 1. 数理工具箱 (v10底座) =====================
-def calculate_entropy(volumes):
-    probs = volumes / (sum(volumes) + 1e-9)
-    return -np.sum(probs * np.log(probs + 1e-9))
+# ===================== 1. 高阶数理工具箱 (v14.0 增强版) =====================
+def calculate_zema(data, period=10):
+    """Zero Lag Exponential Moving Average - 消除量化常见的均线滞后"""
+    ema1 = pd.Series(data).ewm(span=period, adjust=False).mean()
+    ema2 = ema1.ewm(span=period, adjust=False).mean()
+    return (ema1 + (ema1 - ema2)).iloc[-1]
 
-def get_market_metrics(prices, imbs, cvds):
-    if len(prices) < 20: return 0.2, 0.2, 0.0, 0.0, 0.0
-    change = abs(prices[-1] - prices[-15])
-    vol = sum(abs(np.diff(prices[-15:]))) + 1e-9
-    alpha = np.clip((change / vol) * 0.4 + 0.1, 0.1, 0.5)
-    imb_thresh = np.std(imbs) * 2.0 if len(imbs) > 10 else 0.2
-    slope_bp = (np.polyfit(np.arange(10), prices[-10:], 1)[0]) / (prices[-1] + 1e-9)
-    cvd_trend = np.polyfit(np.arange(len(cvds[-15:])), cvds[-15:], 1)[0] if len(cvds) >= 15 else 0
-    atr_sim = np.std(np.diff(prices[-20:])) / (prices[-1] + 1e-9)
-    return alpha, imb_thresh, slope_bp, cvd_trend, atr_sim
+def calculate_zvwap(prices, volumes):
+    """Zero Lag VWAP - 判定机构真实的持仓成本重心"""
+    prices, volumes = np.array(prices), np.array(volumes)
+    typical_p = prices 
+    v_cum = volumes.cumsum()
+    pv_cum = (typical_p * volumes).cumsum()
+    vwap = pv_cum / (v_cum + 1e-9)
+    # 引入零滞后修正
+    vwap_ema = pd.Series(vwap).ewm(span=10).mean()
+    return (vwap * 2 - vwap_ema).iloc[-1]
+
+def get_market_sentiment(quote):
+    """提取基础情绪指标：量比、换手率"""
+    v_ratio = safe_float(quote.get('量比', 1.0))
+    turnover = safe_float(quote.get('换手率', 0.0))
+    return v_ratio, turnover
 
 # ===================== UI 侧边栏交互补全 =====================
 with st.sidebar:
@@ -56,134 +64,109 @@ with st.sidebar:
     refresh_rate = st.slider("审计刷新频率 (秒)", 1, 10, 3)
     init_vault(target_code)
     st.info(f"审计状态: {is_trade_time()[1]}")
-    if st.button("RESET"): st.session_state.clear(); st.rerun()# ===================== 2. 核心审计内核 (全逻辑合并) =====================
-def institutional_kernel(quote, df_bids, df_asks):
-    curr_p = safe_float(quote['最新价'])
-    total_vol_day = safe_float(quote['成交量']) * 100 
-    
-    st.session_state.price_history.append(curr_p)
-    st.session_state.price_history = st.session_state.price_history[-100:]
-    
-    bid_v = df_bids['数量'].apply(safe_float).values
-    ask_v = df_asks['数量'].apply(safe_float).values
-    bid_p = df_bids['价格'].apply(safe_float).values
-    ask_p = df_asks['价格'].apply(safe_float).values
-    
-    bid_v_total, ask_v_total = bid_v.sum(), ask_v.sum()
-    imbalance = (bid_v_total - ask_v_total) / (bid_v_total + ask_v_total + 1e-9)
-    st.session_state.imb_history.append(imbalance)
-    
-    # 2.1 高阶参数与CVD计算 (v10原逻辑)
-    alpha, dyn_thresh, slope_bp, cvd_trend, vol_idx = get_market_metrics(
-        st.session_state.price_history, st.session_state.imb_history, st.session_state.cvd_history
-    )
-    st.session_state.cvd = (1 - alpha) * st.session_state.cvd + alpha * (bid_v_total - ask_v_total)
-    st.session_state.cvd_history.append(st.session_state.cvd)
-    
-    ask_ent = calculate_entropy(ask_v)
-    bid_ent = calculate_entropy(bid_v)
-    avg_ask_v, avg_bid_v = np.mean(ask_v), np.mean(bid_v)
-    
-    # 核心：补回微量单标记 (小于平均30%且<50手)
-    def audit_logic(v, avg_v, entropy, side):
-        if (v >= 500) or (v > avg_v * 2.2):
-            if side == 'ask' and entropy < 1.35: return "🛑 拦截大单"
-            if side == 'bid' and entropy < 1.35: return "🛡️ 诱多托单"
-        if (v < avg_v * 0.3) and (v < 50): return "🪶 微量拆单"
-        return ""
-
-    ask_labels = [audit_logic(v, avg_ask_v, ask_ent, 'ask') for v in ask_v]
-    bid_labels = [audit_logic(v, avg_bid_v, bid_ent, 'bid') for v in bid_v]
-
-    # 2.3 评分矩阵 (补齐卖方逻辑)
-    p_sup = np.percentile(st.session_state.price_history[-30:], 20) if len(st.session_state.price_history)>=30 else curr_p
-    p_res = np.average(ask_p, weights=ask_v) if ask_v_total > 0 else curr_p
-    p_stop = p_sup * 0.995 
-
-    b_score = 0
-    if curr_p > p_stop:
-        if imbalance > dyn_thresh: b_score += 25
-        if cvd_trend > 0: b_score += 25
-        if bid_ent > 1.2: b_score += 50 
-
-    s_score = 0
-    if cvd_trend < 0: s_score += 40
-    if ask_ent < 1.1: s_score += 40
-    if "🛑 拦截大单" in ask_labels: s_score += 20
-
-    vol_adj = np.clip(1 - vol_idx * 100, 0.5, 1.0)
-    pos_percent = 0
-    if b_score >= 80: pos_percent = 80 * vol_adj
-    elif b_score >= 50: pos_percent = 40 * vol_adj
-    if s_score >= 80: pos_percent = -100 
-
-    liq_idx = (np.sum(bid_v * bid_p) * 100 / (total_vol_day * curr_p + 1e-9)) * 100
-
-    return {
-        "p_tp": ask_p[0], "p_entry": bid_p[2], "p_stop": p_stop, "p_sup": p_sup, "p_res": p_res,
-        "curr_p": curr_p, "liq_idx": liq_idx, "b_score": b_score, "s_score": s_score,
-        "pos_percent": pos_percent, "ask_ent": ask_ent, "bid_ent": bid_ent, "cvd_t": cvd_trend,
-        "ask_labels": ask_labels, "bid_labels": bid_labels
-    }# ===================== 3. UI 投行面板 (全要素显示) =====================
-st.set_page_config(page_title="Nova Institutional Vault v13.9", layout="wide")
-trading, trade_msg = is_trade_time()
-
+    if st.button("RESET"): st.session_state.clear(); st.rerun()
+# --- 补在此处 ---
 def fetch_data(code):
     try:
         pre = "sh" if code.startswith('6') else "sz"
-        r = requests.get(f"http://qt.gtimg.cn/q={pre}{code}", timeout=refresh_rate/2)
+        # 实时请求腾讯接口
+        r = requests.get(f"http://qt.gtimg.cn/q={pre}{code}", timeout=1.5)
         p = r.text.split('~')
-        return {'最新价':p[3], '成交量':p[6], 
-                '买盘':pd.DataFrame([{'价格':p[9+i*2], '数量':p[10+i*2]} for i in range(5)]),
-                '卖盘':pd.DataFrame([{'价格':p[19+i*2], '数量':p[20+i*2]} for i in range(5)])}
+        # 核心：必须抓取完整的五档挂单数据
+        return {
+            '最新价': p[3], '成交量': p[6], '量比': p[45] if len(p)>45 else 1.0,
+            '买盘': pd.DataFrame([{'价格':p[9+i*2], '数量':p[10+i*2]} for i in range(5)]),
+            '卖盘': pd.DataFrame([{'价格':p[19+i*2], '数量':p[20+i*2]} for i in range(5)])
+        }
     except: return None
+# --- 补在此处结束 ---
+# ===================== 2. 核心审计内核 (高阶逻辑) =====================
+def institutional_kernel(quote, df_bids, df_asks):
+    # 2.1 基础盘口数据提取
+    curr_p = safe_float(quote['最新价'])
+    bid_v, ask_v = df_bids['数量'].apply(safe_float).values * 100, df_asks['数量'].apply(safe_float).values * 100
+    bid_p, ask_p = df_bids['价格'].apply(safe_float).values, df_asks['价格'].apply(safe_float).values
+    
+    # 2.2 委比 & 委差 (实时意图：衡量量化对冲压制力)
+    total_bid_v, total_ask_v = bid_v.sum(), ask_v.sum()
+    weicha = total_bid_v - total_ask_v  # 委差
+    weibi = (weicha / (total_bid_v + total_ask_v + 1e-9)) * 100 # 委比
+    
+    # 2.3 ZEMA & ZVWAP 动态基准
+    zema = calculate_zema(st.session_state.price_history)
+    zvwap = calculate_zvwap(st.session_state.price_history, st.session_state.imb_history) # 模拟量加权
+    
+    # 2.4 极端价格预测 (情绪动态模型)
+    # 最抄底价：基于 ZVWAP 的负偏离 + 委比支撑
+    p_floor = min(bid_p) * (1 - (abs(weibi)/1000)) if weibi < -20 else bid_p[-1]
+    # 极度获利位：基于 ZEMA 的正偏离 + CVD 动量
+    cvd_t = st.session_state.cvd_history[-1] if st.session_state.cvd_history else 0
+    p_peak = max(ask_p) * (1 + (cvd_t/1e8)) if cvd_t > 0 else ask_p[-1]
 
-if trading:
+    # 2.5 买入/卖出评分时机 (Trader Logic)
+    b_score = 0
+    if curr_p <= zvwap and weibi > 10: b_score += 50  # 价格在重心下方且买盘占优
+    if cvd_t > 0 and zema > curr_p: b_score += 50    # 动量反转触发
+    
+    s_score = 0
+    if curr_p >= zema and weibi < -10: s_score += 50 # 价格超涨且卖盘拦截
+    if total_ask_v > total_bid_v * 1.5: s_score += 50 # 极端拦截压制
+
+    return {
+        "p_floor": p_floor, "p_peak": p_peak, "zvwap": zvwap, "zema": zema,
+        "weibi": weibi, "weicha": weicha, "b_score": b_score, "s_score": s_score,
+        "curr_p": curr_p, "pos_percent": 80 if b_score > 80 else 0
+    }
+    # UI: 第一排 - 极端位与成本重心
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("抄底建议位", f"¥{res['p_floor']:.2f}", "最强支撑")
+        c2.metric("极度获利位", f"¥{res['p_peak']:.2f}", "警惕回落")
+        c3.metric("ZVWAP 重心", f"¥{res['zvwap']:.2f}")
+        c4.metric("委比 / 委差", f"{res['weibi']:.1f}%", f"{int(res['weicha'])}")
+
+        st.divider()
+
+        # UI: 动量审计行
+        st.write(f"🛡️ **ZEMA 基准:** ¥{res['zema']:.2f} | **当前获利空间:** {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
+# ===================== 3. 执行引擎 (核心驱动) =====================
+st.set_page_config(page_title="Vault v14.0", layout="wide")
+
+if is_trade_time()[0]:
     data = fetch_data(target_code)
     if data:
+        # 1. 压入价格历史用于 ZEMA 计算
+        st.session_state.price_history.append(safe_float(data['最新价']))
+        st.session_state.price_history = st.session_state.price_history[-100:]
+        # 模拟 IMB 历史用于 ZVWAP 权重
+        st.session_state.imb_history.append(safe_float(data['成交量']))
+        st.session_state.imb_history = st.session_state.imb_history[-100:]
+        
+        # 2. 运行审计内核
         res = institutional_kernel(data, data['买盘'], data['卖盘'])
         
-        # UI: 第一排 - 执行核心
+        # 3. 渲染 UI 第一排：极端位与成本重心
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("执行仓位 %", f"{res['pos_percent']:.0f}%", f"投放 ¥{total_capital*res['pos_percent']/100:,.0f}")
-        c2.metric("动态止损 (p_stop)", f"¥{res['p_stop']:.2f}")
-        c3.metric("支撑/压力", f"¥{res['p_sup']:.2f} / ¥{res['p_res']:.2f}")
-        c4.metric("流通性厚度", f"{res['liq_idx']:.2f}%")
+        c1.metric("抄底建议位", f"¥{res['p_floor']:.2f}", "最强支撑")
+        c2.metric("极度获利位", f"¥{res['p_peak']:.2f}", "警惕回落")
+        c3.metric("ZVWAP 重心", f"¥{res['zvwap']:.2f}")
+        c4.metric("委比 / 委差", f"{res['weibi']:.1f}%", f"{int(res['weicha'])}")
 
         st.divider()
 
-       # UI: 第二排 - 评分仪表盘 (纯净分数版)
+        # 4. 渲染 UI 第二排：评分时机与 ZEMA 偏离
         l, r = st.columns(2)
         with l:
-            st.write("🌲 **买方审计评分**")
-            # 实时进度条显示分数，根据 b_score 联动
-            st.progress(min(res['b_score']/100, 1.0), text=f"Score: {int(res['b_score'])}")
-            st.metric("买盘真实熵", f"{res['bid_ent']:.2f}", "真实承接" if res['bid_ent']>1.2 else "托单嫌疑")
+            st.write("🌲 **买入审计评分**")
+            st.progress(res['b_score']/100)
+            st.write(f"评分原因：{'重合 ZVWAP' if res['b_score']>0 else '观望'}")
         with r:
-            st.write("🔥 **卖方审计评分**")
-            # 这里联动了 kernel 补齐后的 s_score
-            st.progress(min(res['s_score']/100, 1.0), text=f"Score: {int(res['s_score'])}")
-            st.metric("卖盘拦截熵", f"{res['ask_ent']:.2f}", "抛压分散" if res['ask_ent']>1.2 else "拦截嫌疑")
+            st.write("🔥 **卖出审计评分**")
+            st.progress(res['s_score']/100)
+            st.write(f"评分原因：{'触发 ZEMA 压力' if res['s_score']>0 else '持有'}")
 
-        st.divider()
-        # 移除图表，仅保留高密度数据行
-        st.write(f"📈 **资金动量 (CVD):** {res['cvd_t']:.4f} | **止损位:** ¥{res['p_stop']:.2f} | **最新价:** ¥{res['curr_p']}")# UI: 第三排 - 细节审计列表 (使用 table 提升渲染速度)
-        with st.expander("👁️ 盘口意图审计细节", expanded=True):
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.write("卖盘审计 (Ask)")
-                df_a = data['卖盘'].iloc[::-1].copy()
-                # 注入包含“微量拆单”的审计标签
-                df_a['意图审计'] = res['ask_labels'][::-1]
-                st.table(df_a) 
-            with col_b:
-                st.write("买盘审计 (Bid)")
-                df_b = data['买盘'].copy()
-                df_b['意图审计'] = res['bid_labels']
-                st.table(df_b)
+        st.write(f"🛡️ **ZEMA 基准:** ¥{res['zema']:.2f} | **当前获利空间:** {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
 
-    # 动态刷新控制，联动 sidebar 的 refresh_rate
     time.sleep(refresh_rate)
     st.rerun()
 else:
-    st.warning(f"🚨 内核挂起: {trade_msg}")
+    st.warning(f"🚨 内核挂起: {is_trade_time()[1]}")
