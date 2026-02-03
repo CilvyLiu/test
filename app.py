@@ -128,14 +128,38 @@ def institutional_kernel(quote, df_bids, df_asks):
     bid_depth = np.sum(bid_v * bid_p)
     ask_depth = np.sum(ask_v * ask_p)
 
+    # 2.5 买入/卖出评分与原因审计 (补全逻辑)
+    b_score = 0
+    b_reasons = []
+    if curr_p <= zvwap and weibi > 10: 
+        b_score += 50
+        b_reasons.append("⚖️ 低于重心+强力托单")
+    if cvd_t > 0 and zema > curr_p: 
+        b_score += 50
+        b_reasons.append("🔄 动量翻红+ZEMA支撑")
+    
+    s_score = 0
+    s_reasons = []
+    if curr_p >= zema and weibi < -10: 
+        s_score += 50
+        s_reasons.append("🛑 压力拦截+委比较差")
+    if total_ask_v > total_bid_v * 1.5: 
+        s_score += 50
+        s_reasons.append("🔥 极端压制")
+
+    # 生成最终审计线索
+    b_msg = " | ".join(b_reasons) if b_reasons else "🔭 盘口静默中"
+    s_msg = " | ".join(s_reasons) if s_reasons else "🟢 暂无压制"
+
     return {
         "p_floor": p_floor, "p_peak": p_peak, "zvwap": zvwap, "zema": zema,
         "weibi": weibi, "weicha": weicha, "b_score": b_score, "s_score": s_score,
         "curr_p": curr_p, "bid_depth": bid_depth, "ask_depth": ask_depth,
-        "ask_intents": ask_intents, "bid_intents": bid_intents
+        "ask_intents": ask_intents, "bid_intents": bid_intents,
+        "b_msg": b_msg, "s_msg": s_msg  # <--- 必须补齐这两行
     }
 # ===================== 3. 执行引擎 (核心驱动) =====================
-st.set_page_config(page_title="Vault v14.0", layout="wide")
+st.set_page_config(page_title="Gringotts v14.0", layout="wide")
 
 if is_trade_time()[0]:
     data = fetch_data(target_code)
@@ -166,16 +190,19 @@ if is_trade_time()[0]:
         
         st.divider()
 
-        # 第二排：评分与盘口厚度 (显化分数)
+        # 第二排：双向评分与厚度显示
         l, r = st.columns(2)
         with l:
-            # 这里的 f"分数: {res['b_score']}" 是关键
             st.write(f"🌲 **买入评分: {res['b_score']} / 100** | 承接厚度: ¥{res['bid_depth']:,.0f}")
             st.progress(res['b_score']/100)
+            # 这里是你要的买入原因
+            st.success(f"审计线索: {res['b_msg']}") 
+            
         with r:
             st.write(f"🔥 **卖出评分: {res['s_score']} / 100** | 压制厚度: ¥{res['ask_depth']:,.0f}")
             st.progress(res['s_score']/100)
-            st.write(f"原因：{'压力拦截' if res['s_score'] > 0 else '暂无压制'}")
+            # 这里是卖出原因
+            st.warning(f"审计线索: {res['s_msg']}")
 
         st.write(f"🛡️ **ZEMA 基准:** ¥{res['zema']:.2f} | **当前获利空间:** {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
 # --- 修正后的意图审计细节表格 ---
