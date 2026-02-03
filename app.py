@@ -26,7 +26,7 @@ def init_vault(target_code):
         st.session_state.imb_history = []
         st.session_state.cvd_history = []
         st.session_state.cvd = 0.0
-        st.toast(f"🏛️ v11.8 终极全功能内核挂载: {target_code}")
+        st.toast(f"🏛️ v11.9 全量内核修复挂载: {target_code}")
 
 def safe_float(x, default=0.0):
     try: return float(str(x).replace(',', ''))
@@ -63,7 +63,6 @@ def institutional_kernel(quote, df_bids, df_asks):
     imbalance = (bid_v_total - ask_v_total) / (bid_v_total + ask_v_total + 1e-9)
     st.session_state.imb_history.append(imbalance)
     
-    # 逻辑复原：高阶参数
     alpha, dyn_thresh, slope_bp, cvd_trend, vol_idx = get_market_metrics(
         st.session_state.price_history, st.session_state.imb_history, st.session_state.cvd_history
     )
@@ -74,12 +73,10 @@ def institutional_kernel(quote, df_bids, df_asks):
     ask_ent = calculate_entropy(ask_v_list)
     bid_ent = calculate_entropy(bid_v_list)
     
-    # 逻辑复原：支撑/阻力/止损
     p_sup = np.percentile(st.session_state.price_history[-30:], 20) if len(st.session_state.price_history)>=30 else curr_p
     p_res = np.average(ask_p_list, weights=ask_v_list) if ask_v_total > 0 else curr_p
     p_stop = p_sup * 0.995 
 
-    # 逻辑复原：买/卖评分矩阵
     b_score = 0
     if curr_p > p_stop:
         if curr_p <= p_sup * 1.003: b_score += 20
@@ -95,7 +92,6 @@ def institutional_kernel(quote, df_bids, df_asks):
         if cvd_trend < 0 and slope_bp > 0: s_score += 40 
         if ask_ent < 0.8: s_score -= 30 
 
-    # 逻辑复原：仓位管理
     vol_adj = np.clip(1 - vol_idx * 100, 0.5, 1.0)
     pos_percent = 0
     if b_score >= 80: pos_percent = 80 * vol_adj
@@ -103,7 +99,6 @@ def institutional_kernel(quote, df_bids, df_asks):
     if s_score >= 80: pos_percent = -100 
     elif s_score >= 60: pos_percent = -50  
 
-    # 逻辑合并：执行点位逻辑
     if bid_ent < 1.0:
         bid_audit_msg = "⚠️ 虚假托单：避开诱多"
         p_entry = bid_p_list[2]
@@ -123,7 +118,7 @@ def institutional_kernel(quote, df_bids, df_asks):
     }
 
 # ===================== 3. UI 复原 =====================
-st.set_page_config(page_title="Nova Institutional Vision v11.8", layout="wide")
+st.set_page_config(page_title="Nova Institutional Vision v11.9", layout="wide")
 trading, trade_msg = is_trade_time()
 
 def fetch_data(code):
@@ -137,7 +132,7 @@ def fetch_data(code):
     except: return None
 
 with st.sidebar:
-    st.title("🏛️ Vault v11.8")
+    st.title("🏛️ Vault v11.9")
     target_code = st.text_input("代码", value="601898")
     init_vault(target_code)
     st.info(f"审计状态: {trade_msg}")
@@ -148,7 +143,6 @@ if trading:
     if data:
         res = institutional_kernel(data, data['买盘'], data['卖盘'])
         
-        # UI复原：核心监控区
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("执行建议(仓位)", f"{res['pos_percent']:.0f}%")
         c2.metric("抄底点位", f"¥{res['p_entry']:.2f}", res['bid_audit_msg'])
@@ -157,7 +151,6 @@ if trading:
 
         st.divider()
 
-        # UI复原：评分仪表盘与趋势
         l, r = st.columns(2)
         with l:
             st.write("🌲 **买方多维意图评分**")
@@ -171,17 +164,18 @@ if trading:
         st.divider()
         st.write(f"📈 **资金动量 (CVD Trend):** {res['cvd_t']:.4f} | **当前对冲价:** ¥{res['curr_p']}")
 
-        # UI复原：细节审计
-        with st.expander("👁️ 盘口深度与量化标签细节"):
+        with st.expander("👁️ 盘口深度与量化标签细节", expanded=True):
             col_a, col_b = st.columns(2)
             with col_a:
+                st.write("🔥 卖盘审计 (Ask Side)")
                 df_a = data['卖盘'].iloc[::-1].copy()
                 df_a['意图'] = df_a['数量'].apply(lambda x: "🛑 拦路虎" if safe_float(x) > 500 and res['ask_ent'] < 1.1 else "")
-                st.table(df_a)
+                st.dataframe(df_a, use_container_width=True)
             with col_b:
-                df_b = data['买盤'].copy() if '买盤' in data else data['买盘']
+                st.write("🌲 买盘审计 (Bid Side)")
+                df_b = data['买盘'].copy()
                 df_b['意图'] = df_b['数量'].apply(lambda x: "🛡️ 诱多托单" if safe_float(x) > 500 and res['bid_ent'] < 1.0 else "")
-                st.table(df_b)
+                st.dataframe(df_b, use_container_width=True)
 
     time.sleep(5)
     st.rerun()
