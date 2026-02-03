@@ -117,17 +117,7 @@ def institutional_kernel(quote, df_bids, df_asks):
         "weibi": weibi, "weicha": weicha, "b_score": b_score, "s_score": s_score,
         "curr_p": curr_p, "pos_percent": 80 if b_score > 80 else 0
     }
-    # UI: 第一排 - 极端位与成本重心
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("抄底建议位", f"¥{res['p_floor']:.2f}", "最强支撑")
-        c2.metric("极度获利位", f"¥{res['p_peak']:.2f}", "警惕回落")
-        c3.metric("ZVWAP 重心", f"¥{res['zvwap']:.2f}")
-        c4.metric("委比 / 委差", f"{res['weibi']:.1f}%", f"{int(res['weicha'])}")
 
-        st.divider()
-
-        # UI: 动量审计行
-        st.write(f"🛡️ **ZEMA 基准:** ¥{res['zema']:.2f} | **当前获利空间:** {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
 # ===================== 3. 执行引擎 (核心驱动) =====================
 st.set_page_config(page_title="Vault v14.0", layout="wide")
 
@@ -165,7 +155,16 @@ if is_trade_time()[0]:
             st.write(f"评分原因：{'触发 ZEMA 压力' if res['s_score']>0 else '持有'}")
 
         st.write(f"🛡️ **ZEMA 基准:** ¥{res['zema']:.2f} | **当前获利空间:** {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
-
+# --- 补在此处：意图审计细节表格 ---
+        with st.expander("👁️ 盘口意图审计细节", expanded=True):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.write("卖盘审计 (Ask)")
+                st.table(data['卖盘'].iloc[::-1]) # 倒序显示卖五到卖一
+            with col_b:
+                st.write("买盘审计 (Bid)")
+                st.table(data['买盘']) # 顺序显示买一到买五
+        # --- 补位结束 ---
     time.sleep(refresh_rate)
     st.rerun()
 else:
