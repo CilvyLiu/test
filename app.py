@@ -194,12 +194,30 @@ if data:
     
     st.subheader(f"执行决策：{res['op_info']}")
     
-    c1, c2, c3 = st.columns(3)
-    c1.metric("当前价", f"¥{res['curr_price']}", f"斜率: {res['slope']*10000:.1f} bp")
-    c2.metric("审计支撑", f"¥{res['p_sup']:.2f}", f"买入门槛: ¥{res['min_buy']:.2f}")
-    c3.metric("审计压力", f"¥{res['p_res']:.2f}", f"获利撤退: ¥{res['max_sell']:.2f}")
+    # --- 顶层核心指标增强 ---
+    c1, c2, c3, c4 = st.columns(4) # 增加一列
+    
+    with c1:
+        st.metric("当前成交价", f"¥{res['curr_price']}", f"斜率: {res['slope']*10000:.1f} bp")
+    
+    with c2:
+        # 显示最低买入点（支撑点）
+        st.metric("最低买入位 (防线)", f"¥{res['p_sup']:.2f}", "跌破即锁")
+        
+    with c3:
+        # 显示最高卖出点（压力点）
+        st.metric("最高卖出位 (目标)", f"¥{res['p_res']:.2f}", "重压区", delta_color="inverse")
+        
+    with c4:
+        # 风险状态
+        lock_label = f"🔒 LOCK ({res.get('lock_time_left', 0)}s)" if res['is_locked'] else "🔓 ACTIVE"
+        st.metric("风险锁定", lock_label, f"斜率: {'走平' if abs(res['slope'])<0.0001 else '急变'}")
 
     st.divider()
+    
+    # 在审计栏显示精确的可执行范围
+    st.write(f"🛡️ **量化博弈区间**: [ ¥{res['p_sup']:.2f} (底) <--- 震荡 ---> ¥{res['p_res']:.2f} (顶) ]")
+    st.write(f"⚡ **建议操作点位**: 买入确认位 ≥ ¥{res['min_buy']:.2f} | 撤退先行位 ≤ ¥{res['max_sell']:.2f}")
     b_col, s_col = st.columns(2)
     with b_col:
         st.write("🌲 **买入评分仪表**")
