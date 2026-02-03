@@ -21,9 +21,8 @@ def is_trading_time():
 def init_vault():
     state_keys = {
         "price_history": [],      
-        "volume_history": [],     
         "sup_history": [],        
-        "cvd_history": [],         # 新增：CVD平滑历史
+        "cvd": 0.0,                # 累计成交量差值 (Cumulative Volume Delta)
         "prev_vol_cumulative": 0.0, 
         "risk_lock_active": False,
         "lock_timestamp": 0.0,     
@@ -31,9 +30,7 @@ def init_vault():
         "avg_vol_ema": 0.0,        
         "last_sell_time": 0.0,
         "last_buy_time": 0.0,      
-        "break_count": 0,
-        "cvd": 0.0,                # 新增：CVD累积值
-        "op_info": "系统初始化完成"   # 新增：操作提示
+        "break_count": 0           
     }
     for key, val in state_keys.items():
         if key not in st.session_state:
@@ -47,9 +44,25 @@ def safe_float(x, default=0.0):
         return float(x)
     except: return default
 
-# ===================== 1. 核心工具函数 =====================
+# ===================== 1. 数理内核工具 =====================
+
+def get_slope(prices):
+    """
+    数理逻辑：测算价格一阶导 (Slope)
+    公式：Linear Regression Slope / Current Price
+    用途：识别惯性杀跌，避免“接刀”坑
+    """
+    if len(prices) < 10: return 0.0
+    y = np.array(prices[-10:])
+    x = np.arange(len(y))
+    slope, _ = np.polyfit(x, y, 1)
+    return slope / (prices[-1] + 1e-9)
 
 def safe_weighted_avg(df, price_col, vol_col, fallback):
+    """
+    数理逻辑：成交量加权平均价 (VWAP)
+    公式：Σ(Price * Volume) / ΣVolume
+    """
     try:
         p = df[price_col].apply(safe_float).values
         v = df[vol_col].apply(safe_float).values
@@ -57,120 +70,73 @@ def safe_weighted_avg(df, price_col, vol_col, fallback):
         return np.average(p, weights=v) if v_sum > 0 else fallback
     except: return fallback
 
-def get_filtered_volatility(prices):
-    if len(prices) < 5: return st.session_state.last_valid_vol
-    returns = np.diff(np.log(np.array(prices)))
-    valid_returns = returns[np.abs(returns) > 1e-6]
-    if len(valid_returns) < 3: return st.session_state.last_valid_vol
-    curr_vol = np.std(valid_returns)
-    st.session_state.last_valid_vol = curr_vol
-    return curr_vol
-
-def get_slope(prices):
-    """计算最近10个Tick的价格变化斜率"""
-    if len(prices) < 10: return 0.0
-    y = np.array(prices[-10:])
-    x = np.arange(len(y))
-    slope, _ = np.polyfit(x, y, 1)
-    return slope / (prices[-1] + 1e-9) # 归一化斜率
-
 # ===================== 2. 审计内核 v8.6 =====================
 def gringotts_kernel(quote, df_bids, df_asks):
     curr_p = safe_float(quote['最新价'])
     curr_cum_vol = safe_float(quote['成交量'])
     now_ts = time.time()
     
-    # --- A. 基础数据处理 ---
-    if curr_cum_vol < st.session_state.prev_vol_cumulative:
-        st.session_state.prev_vol_cumulative = curr_cum_vol
-        tick_vol = 0
-    else:
-        tick_vol = max(0, curr_cum_vol - st.session_state.prev_vol_cumulative)
+    # --- A. 量能归一化 (EMA 滤波) ---
+    tick_vol = max(0, curr_cum_vol - st.session_state.prev_vol_cumulative) if curr_cum_vol >= st.session_state.prev_vol_cumulative else 0
     st.session_state.prev_vol_cumulative = curr_cum_vol
-    
     st.session_state.price_history.append(curr_p)
     st.session_state.price_history = st.session_state.price_history[-30:]
-    volatility = get_filtered_volatility(st.session_state.price_history)
     
-    alpha = 0.2
-    st.session_state.avg_vol_ema = alpha * tick_vol + (1 - alpha) * st.session_state.avg_vol_ema if st.session_state.avg_vol_ema > 0 else tick_vol
+    # EMA 相对量比公式：V_ratio = Tick_Vol / EMA(Vol)
+    st.session_state.avg_vol_ema = 0.2 * tick_vol + 0.8 * st.session_state.avg_vol_ema if st.session_state.avg_vol_ema > 0 else tick_vol
     vol_ratio = min(tick_vol / (st.session_state.avg_vol_ema + 1e-9), 10.0)
 
-    # --- B. 支撑/压力与 Epsilon 缓冲区 ---
+    # --- B. 支撑/压力与 ε-缓冲区 ---
+    # Epsilon (ε) = 0.15% 作为博弈确认空间
     EPSILON = 0.0015
     weighted_bid_p = safe_weighted_avg(df_bids, '价格', '数量', fallback=curr_p)
     st.session_state.sup_history.append(weighted_bid_p)
-    st.session_state.sup_history = st.session_state.sup_history[-5:] 
+    st.session_state.sup_history = st.session_state.sup_history[-5:]
     
-    stable_bid_sup = np.median(st.session_state.sup_history)
-    p_sup = min(stable_bid_sup, np.percentile(st.session_state.price_history[-20:], 20)) if len(st.session_state.price_history) >= 20 else stable_bid_sup
+    # 支撑逻辑：取盘口中位数与价格百分位的极小值（防御性审计）
+    p_sup = min(np.median(st.session_state.sup_history), np.percentile(st.session_state.price_history[-20:], 20)) if len(st.session_state.price_history)>=20 else curr_p
     p_res = safe_weighted_avg(df_asks, '价格', '数量', fallback=curr_p)
     
-    min_buy_price = p_sup * (1 + EPSILON)
-    max_sell_price = p_res * (1 - EPSILON)
+    min_buy = p_sup * (1 + EPSILON)  # 入场门槛 (确认上涨动能)
+    max_sell = p_res * (1 - EPSILON) # 撤退门槛 (避免撞压力墙)
 
-    # --- C. 核心进化：斜率与 CVD 意图分析 ---
+    # --- C. 斜率与 CVD 联合审计 ---
     slope = get_slope(st.session_state.price_history)
-    
-    # CVD 计算 (处理字符串并累积)
-    bid_v_sum = df_bids['数量'].apply(safe_float).sum()
-    ask_v_sum = df_asks['数量'].apply(safe_float).sum()
-    delta = bid_v_sum - ask_v_sum
-    
-    # CVD 衰减累积，更灵敏地反映当前主力意图
-    st.session_state.cvd = st.session_state.cvd * 0.9 + delta * 0.1 
+    bid_v = df_bids['数量'].apply(safe_float).sum()
+    ask_v = df_asks['数量'].apply(safe_float).sum()
+    # CVD 累积公式：CVD_t = CVD_t-1 * 0.9 + (Bid_sum - Ask_sum) * 0.1
+    st.session_state.cvd = st.session_state.cvd * 0.9 + (bid_v - ask_v) * 0.1
     is_bullish_cvd = st.session_state.cvd > 0
 
-    # --- D. 决策评分与风控 ---
-    if curr_p < p_sup * 0.996 and vol_ratio > 0.6:
-        st.session_state.break_count += 1
-    else:
-        st.session_state.break_count = max(0, st.session_state.break_count - 1)
-
-    lock_trigger = (st.session_state.break_count >= 2) or (volatility > 0.003)
-    if lock_trigger:
-        st.session_state.risk_lock_active = True
-        st.session_state.lock_timestamp = now_ts
-    elif not (st.session_state.risk_lock_active and (now_ts - st.session_state.lock_timestamp < 30)):
-        st.session_state.risk_lock_active = False
-
-    # 买卖区判定
-    is_in_buy_zone = p_sup <= curr_p <= (min_buy_price * 1.002)
-    is_in_sell_zone = curr_p >= max_sell_price
-
-    # 初始分值
-    b_score = 50 if (not st.session_state.risk_lock_active and is_in_buy_zone) else 0
-    s_score = 40 if is_in_sell_zone else 0
-
-    # --- 博弈修正 ( Nova's Logic ) ---
-    st.session_state.op_info = "市场处于均衡状态"
+    # --- D. 综合评分决策系统 ---
+    # 结构化风控锁逻辑
+    if curr_p < p_sup * 0.996 and vol_ratio > 0.6: st.session_state.break_count += 1
+    else: st.session_state.break_count = max(0, st.session_state.break_count - 1)
     
-    # 1. 坑洞压制：快速下跌 + CVD走弱
-    if slope < -0.0002 and not is_bullish_cvd:
-        b_score *= 0.3
-        st.session_state.op_info = "⚠️ 动能杀跌，避开接刀坑"
+    is_locked = (st.session_state.break_count >= 2)
     
-    # 2. 动能奖励：斜率回归转正 + CVD走强
-    elif slope > 0.0001 and is_bullish_cvd:
-        b_score *= 1.3
-        st.session_state.op_info = "✅ 能量确认，斜率回归买入"
+    # 买方评分 (基于位置、斜率回归与能量验证)
+    b_score = 0
+    if not is_locked and p_sup <= curr_p <= min_buy * 1.002:
+        b_score = 70
+        if slope < -0.0002 and not is_bullish_cvd: b_score *= 0.3 # 坑洞回避逻辑
+        elif slope > 0.0001 and is_bullish_cvd: b_score *= 1.2    # 动能共振奖励
 
-    # 3. 卖方修正：价格上涨但 CVD 走弱 (诱多)
-    if slope > 0.0002 and not is_bullish_cvd:
-        s_score *= 1.4
-        st.session_state.op_info = "🚨 缩量诱多背离，建议撤退"
-    elif slope > 0 and is_bullish_cvd:
-        s_score *= 0.7 # 强势上涨中减少卖出倾向
-
+    # 卖方评分
+    s_score = 0
+    if curr_p >= max_sell:
+        s_score = 70
+        if slope > 0.0002 and not is_bullish_cvd: s_score *= 1.4  # 缩量诱多背离
+        
     return {
-        "p_sup": p_sup, "p_res": p_res, "min_buy": min_buy_price, "max_sell": max_sell_price,
-        "curr_price": curr_p, "buy_score": b_score, "sell_score": s_score,
-        "slope": slope, "cvd": st.session_state.cvd, "op_info": st.session_state.op_info,
-        "is_locked": st.session_state.risk_lock_active
+        "p_sup": p_sup, "p_res": p_res, "curr_p": curr_p,
+        "min_buy": min_buy, "max_sell": max_sell,
+        "b_score": b_score, "s_score": s_score,
+        "slope": slope, "cvd": st.session_state.cvd, "is_locked": is_locked
     }
 
 # ===================== 3. UI 交互层 =====================
-st.set_page_config(page_title="Gringotts v8.6 Slope+CVD", layout="wide")
+st.set_page_config(page_title="Gringotts v8.6 Final", layout="wide")
 
 def fetch_data(code):
     try:
@@ -185,46 +151,38 @@ def fetch_data(code):
 with st.sidebar:
     st.title("🏦 Gringotts v8.6")
     target_code = st.text_input("代码", value="601898")
-    st.metric("CVD 能量流", f"{st.session_state.cvd:.0f}", delta="主力流入" if st.session_state.cvd > 0 else "主力流出")
-    if st.button("Reset State"): st.session_state.clear(); st.rerun()
+    st.write("---")
+    st.write(f"🧬 **内核状态**")
+    st.write(f"CVD: {st.session_state.cvd:.0f}")
+    if st.button("Reset Vault"): st.session_state.clear(); st.rerun()
 
 data = fetch_data(target_code)
 if data:
     res = gringotts_kernel(data, data['买盘'], data['卖盘'])
     
-    st.subheader(f"执行决策：{res['op_info']}")
-    
-    # --- 顶层核心指标增强 ---
-    c1, c2, c3, c4 = st.columns(4) # 增加一列
-    
-    with c1:
-        st.metric("当前成交价", f"¥{res['curr_price']}", f"斜率: {res['slope']*10000:.1f} bp")
-    
-    with c2:
-        # 显示最低买入点（支撑点）
-        st.metric("最低买入位 (防线)", f"¥{res['p_sup']:.2f}", "跌破即锁")
-        
-    with c3:
-        # 显示最高卖出点（压力点）
-        st.metric("最高卖出位 (目标)", f"¥{res['p_res']:.2f}", "重压区", delta_color="inverse")
-        
-    with c4:
-        # 风险状态
-        lock_label = f"🔒 LOCK ({res.get('lock_time_left', 0)}s)" if res['is_locked'] else "🔓 ACTIVE"
-        st.metric("风险锁定", lock_label, f"斜率: {'走平' if abs(res['slope'])<0.0001 else '急变'}")
+    # A. 核心指标列 (四个关键价格)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("当前成交价", f"¥{res['curr_p']}", f"{res['slope']*10000:.1f} bp (斜率)")
+    c2.metric("最低买入位 (防线)", f"¥{res['p_sup']:.2f}", "结构支撑")
+    c3.metric("最高卖出位 (目标)", f"¥{res['p_res']:.2f}", "量化压力")
+    c4.metric("风险锁定状态", "🔒 LOCKED" if res['is_locked'] else "🔓 ACTIVE")
 
     st.divider()
+
+    # B. 操作门槛显示
+    st.write(f"📊 **审计门槛**: 入场确认价 ≥ **¥{res['min_buy']:.2f}** | 获利先行价 ≤ **¥{res['max_sell']:.2f}**")
     
-    # 在审计栏显示精确的可执行范围
-    st.write(f"🛡️ **量化博弈区间**: [ ¥{res['p_sup']:.2f} (底) <--- 震荡 ---> ¥{res['p_res']:.2f} (顶) ]")
-    st.write(f"⚡ **建议操作点位**: 买入确认位 ≥ ¥{res['min_buy']:.2f} | 撤退先行位 ≤ ¥{res['max_sell']:.2f}")
+    # C. 评分仪表盘
     b_col, s_col = st.columns(2)
     with b_col:
-        st.write("🌲 **买入评分仪表**")
-        st.progress(min(res['buy_score']/100, 1.0), text=f"综合评分: {int(res['buy_score'])}")
+        st.write("🌲 **买方审计评分**")
+        st.progress(min(res['b_score']/100, 1.0), text=f"评分: {int(res['b_score'])}")
     with s_col:
-        st.write("🔥 **卖出评分仪表**")
-        st.progress(min(res['sell_score']/100, 1.0), text=f"抛压评分: {int(res['sell_score'])}")
+        st.write("🔥 **卖方审计评分**")
+        st.progress(min(res['s_score']/100, 1.0), text=f"评分: {int(res['s_score'])}")
+
+else:
+    st.warning("数据链连接异常，检查网络或代码...")
 
 time.sleep(5)
 st.rerun()
