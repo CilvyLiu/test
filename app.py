@@ -58,7 +58,7 @@ def get_market_sentiment(quote):
 
 # ===================== UI 侧边栏交互补全 =====================
 with st.sidebar:
-    st.title("🏛️ Vault v13.9")
+    st.title("🏛️ Gringotts v13.9")
     target_code = st.text_input("代码", value="601898")
     total_capital = st.number_input("总投放金额 (CNY)", value=100000)
     refresh_rate = st.slider("审计刷新频率 (秒)", 1, 10, 3)
@@ -166,15 +166,16 @@ if is_trade_time()[0]:
         
         st.divider()
 
-        # 第二排：评分与盘口厚度
+        # 第二排：评分与盘口厚度 (显化分数)
         l, r = st.columns(2)
         with l:
-            st.write(f"🌲 **买入评分: {res['b_score']}** (厚度: ¥{res['bid_depth']:,.0f})")
+            # 这里的 f"分数: {res['b_score']}" 是关键
+            st.write(f"🌲 **买入评分: {res['b_score']} / 100** | 承接厚度: ¥{res['bid_depth']:,.0f}")
             st.progress(res['b_score']/100)
         with r:
-            st.write(f"🔥 **卖出评分: {res['s_score']}** (厚度: ¥{res['ask_depth']:,.0f})")
+            st.write(f"🔥 **卖出评分: {res['s_score']} / 100** | 压制厚度: ¥{res['ask_depth']:,.0f}")
             st.progress(res['s_score']/100)
-            st.write(f"评分原因：{'触发 ZEMA 压力' if res['s_score']>0 else '持有'}")
+            st.write(f"原因：{'压力拦截' if res['s_score'] > 0 else '暂无压制'}")
 
         st.write(f"🛡️ **ZEMA 基准:** ¥{res['zema']:.2f} | **当前获利空间:** {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
 # --- 修正后的意图审计细节表格 ---
