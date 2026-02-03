@@ -117,7 +117,28 @@ def institutional_kernel(quote, df_bids, df_asks):
         "weibi": weibi, "weicha": weicha, "b_score": b_score, "s_score": s_score,
         "curr_p": curr_p, "pos_percent": 80 if b_score > 80 else 0
     }
+# 2.5 盘口厚度与意图审计 (核心：穿透量化挂单)
+    avg_bid_v, avg_ask_v = np.mean(bid_v), np.mean(ask_v)
+    
+    def get_intent(v, avg_v, side):
+        if v > avg_v * 3: return "🛑 拦截大单" if side=='ask' else "🛡️ 强力托单"
+        if v < avg_v * 0.2: return "🪶 微量探测"
+        return "稳定"
 
+    # 生成意图标签
+    ask_intents = [get_intent(v, avg_ask_v, 'ask') for v in ask_v]
+    bid_intents = [get_intent(v, avg_bid_v, 'bid') for v in bid_v]
+    
+    # 盘口厚度 (Total Depth Amount)
+    bid_depth = np.sum(bid_v * bid_p)
+    ask_depth = np.sum(ask_v * ask_p)
+
+    return {
+        "p_floor": p_floor, "p_peak": p_peak, "zvwap": zvwap, "zema": zema,
+        "weibi": weibi, "weicha": weicha, "b_score": b_score, "s_score": s_score,
+        "curr_p": curr_p, "bid_depth": bid_depth, "ask_depth": ask_depth,
+        "ask_intents": ask_intents, "bid_intents": bid_intents
+    }
 # ===================== 3. 执行引擎 (核心驱动) =====================
 st.set_page_config(page_title="Vault v14.0", layout="wide")
 
@@ -134,36 +155,40 @@ if is_trade_time()[0]:
         # 2. 运行审计内核
         res = institutional_kernel(data, data['买盘'], data['卖盘'])
         
-        # 3. 渲染 UI 第一排：极端位与成本重心
+        # 第一排：价格与极端位 (高亮显示)
+        st.subheader(f"📊 当前价格: ¥{res['curr_p']} | 获利空间: {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("抄底建议位", f"¥{res['p_floor']:.2f}", "最强支撑")
-        c2.metric("极度获利位", f"¥{res['p_peak']:.2f}", "警惕回落")
-        c3.metric("ZVWAP 重心", f"¥{res['zvwap']:.2f}")
+        c1.metric("最低吸入位", f"¥{res['p_floor']:.2f}", "抄底点", delta_color="normal")
+        c2.metric("最高获利位", f"¥{res['p_peak']:.2f}", "止盈点", delta_color="inverse")
+        c3.metric("机构成本 (ZVWAP)", f"¥{res['zvwap']:.2f}")
         c4.metric("委比 / 委差", f"{res['weibi']:.1f}%", f"{int(res['weicha'])}")
 
         st.divider()
 
-        # 4. 渲染 UI 第二排：评分时机与 ZEMA 偏离
+        # 第二排：评分与盘口厚度
         l, r = st.columns(2)
         with l:
-            st.write("🌲 **买入审计评分**")
+            st.write(f"🌲 **买入评分: {res['b_score']}** (厚度: ¥{res['bid_depth']:,.0f})")
             st.progress(res['b_score']/100)
-            st.write(f"评分原因：{'重合 ZVWAP' if res['b_score']>0 else '观望'}")
         with r:
-            st.write("🔥 **卖出审计评分**")
+            st.write(f"🔥 **卖出评分: {res['s_score']}** (厚度: ¥{res['ask_depth']:,.0f})")
             st.progress(res['s_score']/100)
             st.write(f"评分原因：{'触发 ZEMA 压力' if res['s_score']>0 else '持有'}")
 
         st.write(f"🛡️ **ZEMA 基准:** ¥{res['zema']:.2f} | **当前获利空间:** {((res['p_peak']/res['curr_p']-1)*100):.2f}%")
 # --- 补在此处：意图审计细节表格 ---
-        with st.expander("👁️ 盘口意图审计细节", expanded=True):
+       with st.expander("👁️ 盘口意图与挂单审计", expanded=True):
             col_a, col_b = st.columns(2)
             with col_a:
-                st.write("卖盘审计 (Ask)")
-                st.table(data['卖盘'].iloc[::-1]) # 倒序显示卖五到卖一
+                st.write("卖方盘口 (Ask)")
+                df_a = data['卖盘'].iloc[::-1].copy()
+                df_a['意图'] = res['ask_intents'][::-1]
+                st.table(df_a)
             with col_b:
-                st.write("买盘审计 (Bid)")
-                st.table(data['买盘']) # 顺序显示买一到买五
+                st.write("买方盘口 (Bid)")
+                df_b = data['买盘'].copy()
+                df_b['意图'] = res['bid_intents']
+                st.table(df_b)
         # --- 补位结束 ---
     time.sleep(refresh_rate)
     st.rerun()
