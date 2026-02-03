@@ -152,35 +152,38 @@ if trading:
 
         st.divider()
 
-        # UI: 第二排 - 评分仪表盘
+       # UI: 第二排 - 评分仪表盘 (纯净分数版)
         l, r = st.columns(2)
         with l:
             st.write("🌲 **买方审计评分**")
+            # 实时进度条显示分数，根据 b_score 联动
             st.progress(min(res['b_score']/100, 1.0), text=f"Score: {int(res['b_score'])}")
             st.metric("买盘真实熵", f"{res['bid_ent']:.2f}", "真实承接" if res['bid_ent']>1.2 else "托单嫌疑")
         with r:
             st.write("🔥 **卖方审计评分**")
+            # 这里联动了 kernel 补齐后的 s_score
             st.progress(min(res['s_score']/100, 1.0), text=f"Score: {int(res['s_score'])}")
             st.metric("卖盘拦截熵", f"{res['ask_ent']:.2f}", "抛压分散" if res['ask_ent']>1.2 else "拦截嫌疑")
 
         st.divider()
-        st.write(f"📈 **资金动量 (CVD):** {res['cvd_t']:.4f} | **最新价:** ¥{res['curr_p']}")
-        if len(st.session_state.cvd_history) > 2:
-            st.line_chart(st.session_state.cvd_history[-30:])
-
+        # 移除图表，仅保留高密度数据行
+        st.write(f"📈 **资金动量 (CVD):** {res['cvd_t']:.4f} | **止损位:** ¥{res['p_stop']:.2f} | **最新价:** ¥{res['curr_p']}")# UI: 第三排 - 细节审计列表 (使用 table 提升渲染速度)
         with st.expander("👁️ 盘口意图审计细节", expanded=True):
             col_a, col_b = st.columns(2)
             with col_a:
                 st.write("卖盘审计 (Ask)")
                 df_a = data['卖盘'].iloc[::-1].copy()
+                # 注入包含“微量拆单”的审计标签
                 df_a['意图审计'] = res['ask_labels'][::-1]
-                st.table(df_a)
+                st.table(df_a) 
             with col_b:
                 st.write("买盘审计 (Bid)")
                 df_b = data['买盘'].copy()
                 df_b['意图审计'] = res['bid_labels']
                 st.table(df_b)
 
-    time.sleep(refresh_rate); st.rerun()
+    # 动态刷新控制，联动 sidebar 的 refresh_rate
+    time.sleep(refresh_rate)
+    st.rerun()
 else:
     st.warning(f"🚨 内核挂起: {trade_msg}")
